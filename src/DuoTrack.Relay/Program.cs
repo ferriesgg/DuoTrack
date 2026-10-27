@@ -175,7 +175,7 @@ app.Map("/connect", async context =>
             }
 
             if (result.MessageType != WebSocketMessageType.Binary || !result.EndOfMessage ||
-                !RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var targetId, out _))
+                !RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var targetId, out var packet))
             {
                 await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "Invalid input message", context.RequestAborted);
                 break;
@@ -188,7 +188,9 @@ app.Map("/connect", async context =>
 
             if (connections.TryGet(targetId, out var target))
             {
-                await target.SendAsync(buffer.AsMemory(0, result.Count), context.RequestAborted);
+                // Client -> relay carries the destination; relay -> client carries
+                // the authenticated source so a screen can return control to it.
+                await target.SendAsync(RelayWire.EncodeInput(deviceId, packet), context.RequestAborted);
             }
         }
     }
@@ -209,7 +211,7 @@ app.Map("/connect", async context =>
             {
                 try
                 {
-                    await target.SendAsync(RelayWire.EncodeInput(peer.Id, release), CancellationToken.None);
+                    await target.SendAsync(RelayWire.EncodeInput(deviceId, release), CancellationToken.None);
                 }
                 catch
                 {

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/DuoTrack.Client/ControlHotkeyState.cs" Link="ControlHotkeyState.cs" />
+    <Compile Include="../../src/DuoTrack.Client/NativeMethods.cs" Link="NativeMethods.cs" />
+    <Compile Include="../../src/DuoTrack.Client/ScreenGeometry.cs" Link="ScreenGeometry.cs" />
+    <Compile Include="../../src/DuoTrack.Protocol/InputPacket.cs" Link="InputPacket.cs" />
+  </ItemGroup>
+</Project>

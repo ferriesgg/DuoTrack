@@ -1,7 +1,7 @@
 <Window x:Class="DuoTrack.Client.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DuoTrack" Width="760" Height="650" MinWidth="680" MinHeight="540"
+        Title="DuoTrack" Width="880" Height="830" MinWidth="800" MinHeight="650"
         WindowStartupLocation="CenterScreen" Background="#F5F7FB">
     <Grid Margin="24">
         <Grid.RowDefinitions>
@@ -54,10 +54,12 @@
             </Grid.ColumnDefinitions>
 
             <Border Grid.Column="0" Background="White" CornerRadius="12" Padding="18">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <DockPanel LastChildFill="False">
@@ -65,15 +67,35 @@
                         <Button Content="刷新" Click="RefreshDevices_Click" DockPanel.Dock="Right" Padding="10,4" MinHeight="28" />
                     </DockPanel>
                     <ListBox Grid.Row="1" x:Name="DevicesList" Margin="0,14,0,12"
+                             MinHeight="90"
                              DisplayMemberPath="DisplayText" SelectionChanged="DevicesList_SelectionChanged"
                              FontSize="15" Padding="4" />
-                    <StackPanel Grid.Row="2">
+                    <StackPanel Grid.Row="2" Margin="0,0,0,12">
+                        <TextBlock Text="屏幕布局" FontSize="16" FontWeight="SemiBold" />
+                        <TextBlock Text="先选择设备，再点击方位，指定它相对本机的位置。" TextWrapping="Wrap" Foreground="#6B7280" Margin="0,5,0,6" />
+                        <Grid Height="146">
+                            <Grid.RowDefinitions><RowDefinition /><RowDefinition /><RowDefinition /></Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition /><ColumnDefinition /></Grid.ColumnDefinitions>
+                            <Button x:Name="LayoutTop" Grid.Row="0" Grid.Column="1" Content="↑ 上方" Tag="Top" Click="LayoutSide_Click" Padding="4" />
+                            <Button x:Name="LayoutLeft" Grid.Row="1" Grid.Column="0" Content="← 左侧" Tag="Left" Click="LayoutSide_Click" Padding="4" />
+                            <Border Grid.Row="1" Grid.Column="1" Background="#E5E7EB" CornerRadius="6" Margin="4">
+                                <TextBlock Text="本机" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold" />
+                            </Border>
+                            <Button x:Name="LayoutRight" Grid.Row="1" Grid.Column="2" Content="右侧 →" Tag="Right" Click="LayoutSide_Click" Padding="4" />
+                            <Button x:Name="LayoutBottom" Grid.Row="2" Grid.Column="1" Content="↓ 下方" Tag="Bottom" Click="LayoutSide_Click" Padding="4" />
+                        </Grid>
+                        <TextBlock x:Name="LayoutDescription" TextWrapping="Wrap" Foreground="#2563EB" Margin="0,4,0,8" />
+                        <CheckBox x:Name="EdgeSwitchCheck" Content="鼠标到屏幕边缘时自动切换" Checked="EdgeSwitch_Changed" Unchecked="EdgeSwitch_Changed" />
+                        <TextBlock Text="进入远端后，从连接边缘移回即可返回本机。" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,5,0,0" />
+                    </StackPanel>
+                    <StackPanel Grid.Row="3">
                         <Button x:Name="ControlButton" Content="选择一台在线设备" Click="Control_Click"
                                 IsEnabled="False" Background="#2563EB" Foreground="White" BorderThickness="0" />
                         <TextBlock Text="也可以按 Ctrl + Alt + F12 开始或停止控制"
                                    HorizontalAlignment="Center" Foreground="#6B7280" FontSize="12" Margin="0,5,0,0" />
                     </StackPanel>
                 </Grid>
+                </ScrollViewer>
             </Border>
 
             <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">

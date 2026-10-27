@@ -13,9 +13,21 @@ internal sealed class InputHookManager : IDisposable
     private volatile bool _connected;
     private volatile bool _canForward;
     private volatile bool _forwarding;
-    private bool _controlDown;
-    private bool _altDown;
+    private readonly ControlHotkeyState _hotkey = new();
     private NativeMethods.Point? _mouseAnchor;
+    private NativeMethods.Point? _previousMouse;
+    private ScreenGeometry? _sourceScreen;
+    private long _edgeCooldownUntil;
+    public bool EdgeSwitchEnabled { get; set; }
+    public bool IsReceiving { get; private set; }
+    public ScreenSide RemoteScreenSide { get; set; } = ScreenSide.Right;
+
+    public void SetReceiving(bool receiving)
+    {
+        IsReceiving = receiving;
+        _previousMouse = null;
+        _edgeCooldownUntil = Environment.TickCount64 + 800;
+    }
 
     public event Action<InputPacket>? PacketCaptured;
     public event Action<bool>? ForwardingChanged;
@@ -60,12 +72,17 @@ internal sealed class InputHookManager : IDisposable
         }
     }
 
-    public bool StartForwarding()
+    public bool StartForwarding(bool fromEdge = false)
     {
-        if (!_connected || !_canForward || _forwarding) return false;
+        if (!_connected || !_canForward || _forwarding || IsReceiving) return false;
         NativeMethods.GetCursorPos(out var anchor);
-        _mouseAnchor = anchor;
+        var bounds = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point(anchor.X, anchor.Y)).Bounds;
+        _sourceScreen = new ScreenGeometry(bounds.X, bounds.Y, bounds.Width, bounds.Height);
+        var fraction = _sourceScreen.Value.Fraction(RemoteScreenSide, anchor.X, anchor.Y);
+        _mouseAnchor = new NativeMethods.Point { X = bounds.X + bounds.Width / 2, Y = bounds.Y + bounds.Height / 2 };
         _forwarding = true;
+        PacketCaptured?.Invoke(new InputPacket(InputEventType.EnterScreen, (int)RemoteScreenSide, fraction, fromEdge ? 1u : 0u));
+        NativeMethods.SetCursorPos(_mouseAnchor.Value.X, _mouseAnchor.Value.Y);
         ForwardingChanged?.Invoke(true);
         return true;
     }
@@ -75,8 +92,25 @@ internal sealed class InputHookManager : IDisposable
         if (!_forwarding) return;
         _forwarding = false;
         _mouseAnchor = null;
+        _previousMouse = null;
+        _edgeCooldownUntil = Environment.TickCount64 + 800;
+        if (_sourceScreen is { } screen)
+        {
+            var position = screen.Position(RemoteScreenSide, 5000);
+            NativeMethods.SetCursorPos(position.X, position.Y);
+        }
         PacketCaptured?.Invoke(new InputPacket(InputEventType.ReleaseAll));
         ForwardingChanged?.Invoke(false);
+    }
+
+    public void ReturnFromEdge(int fraction)
+    {
+        StopForwarding();
+        if (_sourceScreen is { } screen)
+        {
+            var position = screen.Position(RemoteScreenSide, fraction);
+            NativeMethods.SetCursorPos(position.X, position.Y);
+        }
     }
 
     private nint KeyboardHook(int code, nint wParam, nint lParam)
@@ -100,9 +134,8 @@ internal sealed class InputHookManager : IDisposable
             return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
         }
 
-        UpdateModifierState((int)data.VkCode, isDown);
-
-        if (isDown && data.VkCode == NativeMethods.VkF12 && _controlDown && _altDown)
+        var hotkeyAction = _hotkey.Process((int)data.VkCode, isDown);
+        if (hotkeyAction == HotkeyAction.Toggle)
         {
             if (_forwarding)
             {
@@ -113,6 +146,11 @@ internal sealed class InputHookManager : IDisposable
                 StartForwarding();
             }
 
+            return 1;
+        }
+
+        if (hotkeyAction == HotkeyAction.Consume)
+        {
             return 1;
         }
 
@@ -143,12 +181,42 @@ internal sealed class InputHookManager : IDisposable
         }
 
         var data = Marshal.PtrToStructure<NativeMethods.MsLlHookStruct>(lParam);
-        if ((data.Flags & NativeMethods.LlmhfInjected) != 0 || !_forwarding)
+        if ((data.Flags & NativeMethods.LlmhfInjected) != 0)
         {
             return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam);
         }
 
         var message = unchecked((int)wParam);
+        if (!_forwarding)
+        {
+            if (message == NativeMethods.WmMouseMove)
+            {
+                var previous = _previousMouse;
+                _previousMouse = data.Pt;
+                if (EdgeSwitchEnabled && !IsReceiving && _connected && _canForward
+                    && Environment.TickCount64 >= _edgeCooldownUntil && previous is { } old)
+                {
+                    var bounds = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point(data.Pt.X, data.Pt.Y)).Bounds;
+                    var screen = new ScreenGeometry(bounds.X, bounds.Y, bounds.Width, bounds.Height);
+                    var dx = data.Pt.X - old.X;
+                    var dy = data.Pt.Y - old.Y;
+                    // Internal monitor boundaries are not computer boundaries.
+                    var outside = RemoteScreenSide switch
+                    {
+                        ScreenSide.Left => new System.Drawing.Point(bounds.Left - 1, data.Pt.Y),
+                        ScreenSide.Right => new System.Drawing.Point(bounds.Right, data.Pt.Y),
+                        ScreenSide.Top => new System.Drawing.Point(data.Pt.X, bounds.Top - 1),
+                        _ => new System.Drawing.Point(data.Pt.X, bounds.Bottom),
+                    };
+                    if (screen.AtEdge(RemoteScreenSide, data.Pt.X, data.Pt.Y)
+                        && ScreenGeometry.MovingOut(RemoteScreenSide, dx, dy)
+                        && !System.Windows.Forms.Screen.AllScreens.Any(s => s.Bounds.Contains(outside))
+                        && StartForwarding(fromEdge: true)) return 1;
+                }
+            }
+            return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam);
+        }
+
         switch (message)
         {
             case NativeMethods.WmMouseMove:
@@ -191,18 +259,6 @@ internal sealed class InputHookManager : IDisposable
 
     private void EmitButton(MouseButton button, bool isDown) =>
         PacketCaptured?.Invoke(new InputPacket(InputEventType.MouseButton, (int)button, isDown ? 1 : 0));
-
-    private void UpdateModifierState(int virtualKey, bool isDown)
-    {
-        if (virtualKey is NativeMethods.VkControl or NativeMethods.VkLControl or NativeMethods.VkRControl)
-        {
-            _controlDown = isDown;
-        }
-        else if (virtualKey is NativeMethods.VkMenu or NativeMethods.VkLMenu or NativeMethods.VkRMenu)
-        {
-            _altDown = isDown;
-        }
-    }
 
     public void Dispose()
     {

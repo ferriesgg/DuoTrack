@@ -85,8 +85,38 @@ try {
         if ($result.Count -ne 30 -or $received[0] -ne 1 -or $received[17] -ne 5) {
             throw "WebSocket relay returned an invalid input envelope."
         }
+        if ([Guid]::new([byte[]]$received[1..16]) -ne $first.Id) {
+            throw "Relay did not identify the authenticated sender."
+        }
+        $timeout.Dispose()
 
-        Write-Host "PASS: registration, signed authentication, pairing, device listing, and WebSocket relay"
+        # Enter remote screen, then send the return message back to the controller.
+        foreach ($transition in @(
+            @{ Sender = $firstSocket; Receiver = $secondSocket; Source = $first.Id; Target = $second.Id; Type = 6 },
+            @{ Sender = $secondSocket; Receiver = $firstSocket; Source = $second.Id; Target = $first.Id; Type = 7 }
+        )) {
+            [byte[]]$message = [byte[]]::new(30)
+            $message[0] = 1
+            $transition.Target.ToByteArray().CopyTo($message, 1)
+            $message[17] = $transition.Type
+            [BitConverter]::GetBytes([int]1).CopyTo($message, 18)
+            [BitConverter]::GetBytes([int]7500).CopyTo($message, 22)
+            [BitConverter]::GetBytes([uint32]1).CopyTo($message, 26)
+            $transition.Sender.SendAsync([ArraySegment[byte]]::new($message), [Net.WebSockets.WebSocketMessageType]::Binary, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
+            [byte[]]$received = [byte[]]::new(64)
+            $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(5))
+            try {
+                $result = $transition.Receiver.ReceiveAsync([ArraySegment[byte]]::new($received), $timeout.Token).GetAwaiter().GetResult()
+                if ($result.Count -ne 30 -or $received[17] -ne $transition.Type -or
+                    [Guid]::new([byte[]]$received[1..16]) -ne $transition.Source -or
+                    [BitConverter]::ToInt32($received, 22) -ne 7500) {
+                    throw "Screen transition was not routed correctly."
+                }
+            }
+            finally { $timeout.Dispose() }
+        }
+
+        Write-Host "PASS: registration, signed authentication, pairing, device listing, sender identity, screen entry and return control"
     }
     finally {
         $firstSocket.Dispose()

@@ -9,7 +9,11 @@ public enum InputEventType : byte
     MouseButton = 3,
     MouseWheel = 4,
     ReleaseAll = 5,
+    EnterScreen = 6,
+    ReturnControl = 7,
 }
+
+public enum ScreenSide { Left, Right, Top, Bottom }
 
 public enum MouseButton : byte
 {

@@ -6,8 +6,7 @@ namespace DuoTrack.Client;
 
 internal sealed class BridgeConnection(
     BridgeApiClient api,
-    string deviceName,
-    WindowsInputInjector injector) : IDisposable
+    string deviceName) : IDisposable
 {
     private readonly Channel<byte[]> _outgoing = Channel.CreateUnbounded<byte[]>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -18,6 +17,7 @@ internal sealed class BridgeConnection(
     public bool IsConnected { get; private set; }
     public event Action<bool>? ConnectionChanged;
     public event Action<string>? StatusChanged;
+    public event Action<Guid, InputPacket>? PacketReceived;
 
     public void Start() => _runTask ??= Task.Run(() => RunAsync(_shutdown.Token));
 
@@ -36,6 +36,11 @@ internal sealed class BridgeConnection(
         {
             _outgoing.Writer.TryWrite(RelayWire.EncodeInput(target, packet));
         }
+    }
+
+    public void SendTo(Guid target, InputPacket packet)
+    {
+        if (IsConnected) _outgoing.Writer.TryWrite(RelayWire.EncodeInput(target, packet));
     }
 
     private async Task RunAsync(CancellationToken cancellationToken)
@@ -72,7 +77,6 @@ internal sealed class BridgeConnection(
             finally
             {
                 SetConnected(false);
-                injector.ReleaseAll();
                 while (_outgoing.Reader.TryRead(out _)) { }
             }
 
@@ -99,9 +103,9 @@ internal sealed class BridgeConnection(
             }
 
             if (result.MessageType == WebSocketMessageType.Binary && result.EndOfMessage &&
-                RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out _, out var packet))
+                RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var source, out var packet))
             {
-                injector.Apply(packet);
+                PacketReceived?.Invoke(source, packet);
             }
         }
     }
@@ -133,6 +137,5 @@ internal sealed class BridgeConnection(
         _shutdown.Cancel();
         try { _runTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
         _shutdown.Dispose();
-        injector.ReleaseAll();
     }
 }

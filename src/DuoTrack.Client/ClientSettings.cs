@@ -7,6 +7,9 @@ internal sealed class ClientSettings
     public string ServerUrl { get; set; } = string.Empty;
     public string DeviceName { get; set; } = Environment.MachineName;
     public bool StartWithWindows { get; set; }
+    public bool EdgeSwitchEnabled { get; set; }
+    public DuoTrack.Protocol.ScreenSide RemoteScreenSide { get; set; } = DuoTrack.Protocol.ScreenSide.Right;
+    public Guid? LayoutDeviceId { get; set; }
 
     public static ClientSettings Load()
     {

@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Windows;
 using System.Windows.Threading;
 using Forms = System.Windows.Forms;
+using DuoTrack.Protocol;
 
 namespace DuoTrack.Client;
 
@@ -21,12 +22,17 @@ public partial class MainWindow : Window
     private bool _initializing = true;
     private bool _refreshing;
     private bool _updatingDevices;
+    private Guid? _incomingDeviceId;
+    private ScreenSide _incomingReturnSide;
+    private ScreenGeometry _incomingScreen;
+    private bool _incomingCanReturn;
 
     public MainWindow()
     {
         InitializeComponent();
         _api = new BridgeApiClient(_identity);
         _hooks = new InputHookManager();
+        if (!Enum.IsDefined(_settings.RemoteScreenSide)) _settings.RemoteScreenSide = ScreenSide.Right;
         _hooks.PacketCaptured += packet => _connection?.Send(packet);
         _hooks.ForwardingChanged += forwarding => Dispatcher.BeginInvoke(() => UpdateControlState(forwarding));
 
@@ -34,6 +40,10 @@ public partial class MainWindow : Window
         ServerUrlBox.Text = _settings.ServerUrl;
         DeviceNameBox.Text = _settings.DeviceName;
         StartWithWindowsCheck.IsChecked = _settings.StartWithWindows;
+        EdgeSwitchCheck.IsChecked = _settings.EdgeSwitchEnabled;
+        _hooks.EdgeSwitchEnabled = _settings.EdgeSwitchEnabled;
+        _hooks.RemoteScreenSide = _settings.RemoteScreenSide;
+        UpdateLayoutPreview();
 
         _trayIcon = CreateTrayIcon();
         _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
@@ -75,10 +85,19 @@ public partial class MainWindow : Window
         try
         {
             _api.Configure(_settings.ServerUrl);
+            EndIncomingControl();
+            _hooks.StopForwarding();
             _connection?.Dispose();
-            _connection = new BridgeConnection(_api, _settings.DeviceName, _injector);
+            _connection = new BridgeConnection(_api, _settings.DeviceName);
+            var connection = _connection;
+            connection.PacketReceived += (source, packet) => Dispatcher.BeginInvoke(() =>
+            {
+                if (ReferenceEquals(connection, _connection) && connection.IsConnected)
+                    ReceiveInput(source, packet);
+            });
             _connection.ConnectionChanged += connected => Dispatcher.BeginInvoke(async () =>
             {
+                if (!ReferenceEquals(connection, _connection)) return;
                 _hooks.SetConnected(connected);
                 CreatePairingButton.IsEnabled = connected;
                 JoinPairingButton.IsEnabled = connected;
@@ -93,6 +112,7 @@ public partial class MainWindow : Window
                 }
                 else
                 {
+                    EndIncomingControl();
                     _refreshTimer.Stop();
                     _hooks.SetCanForward(false);
                     ControlButton.IsEnabled = false;
@@ -116,8 +136,8 @@ public partial class MainWindow : Window
         _refreshing = true;
         try
         {
-            var selectedId = (DevicesList.SelectedItem as DeviceInfo)?.Id;
             var devices = await _api.GetDevicesAsync(CancellationToken.None);
+            var selectedId = (DevicesList.SelectedItem as DeviceInfo)?.Id ?? _settings.LayoutDeviceId;
             _updatingDevices = true;
             try
             {
@@ -133,6 +153,7 @@ public partial class MainWindow : Window
             }
 
             ApplyDeviceSelection(DevicesList.SelectedItem as DeviceInfo, stopForwarding: false);
+            UpdateLayoutPreview();
         }
         catch (Exception ex)
         {
@@ -183,6 +204,12 @@ public partial class MainWindow : Window
     {
         if (_updatingDevices) return;
         ApplyDeviceSelection(DevicesList.SelectedItem as DeviceInfo, stopForwarding: true);
+        if (!_initializing && DevicesList.SelectedItem is DeviceInfo device)
+        {
+            _settings.LayoutDeviceId = device.Id;
+            _settings.Save();
+        }
+        UpdateLayoutPreview();
     }
 
     private void ApplyDeviceSelection(DeviceInfo? selected, bool stopForwarding)
@@ -223,6 +250,121 @@ public partial class MainWindow : Window
                 ? System.Windows.Media.Color.FromRgb(220, 38, 38)
                 : System.Windows.Media.Color.FromRgb(37, 99, 235));
         _trayIcon.Text = forwarding ? "DuoTrack - 正在远程控制" : "DuoTrack";
+    }
+
+    private void LayoutSide_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button button ||
+            !Enum.TryParse<ScreenSide>(button.Tag?.ToString(), out var side)) return;
+        _hooks.StopForwarding();
+        _settings.RemoteScreenSide = side;
+        _hooks.RemoteScreenSide = side;
+        _settings.Save();
+        UpdateLayoutPreview();
+    }
+
+    private void EdgeSwitch_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initializing) return;
+        _settings.EdgeSwitchEnabled = EdgeSwitchCheck.IsChecked == true;
+        _hooks.EdgeSwitchEnabled = _settings.EdgeSwitchEnabled;
+        _settings.Save();
+    }
+
+    private void UpdateLayoutPreview()
+    {
+        var selected = DevicesList.SelectedItem as DeviceInfo;
+        foreach (var button in new[] { LayoutLeft, LayoutRight, LayoutTop, LayoutBottom })
+        {
+            var active = button.Tag?.ToString() == _settings.RemoteScreenSide.ToString();
+            button.Background = new System.Windows.Media.SolidColorBrush(
+                active ? System.Windows.Media.Color.FromRgb(219, 234, 254) : System.Windows.Media.Colors.White);
+            button.BorderBrush = new System.Windows.Media.SolidColorBrush(
+                active ? System.Windows.Media.Color.FromRgb(37, 99, 235) : System.Windows.Media.Color.FromRgb(209, 213, 219));
+        }
+        var sideName = _settings.RemoteScreenSide switch
+        {
+            ScreenSide.Left => "左侧", ScreenSide.Right => "右侧",
+            ScreenSide.Top => "上方", _ => "下方",
+        };
+        LayoutDescription.Text = selected is null ? "请选择要放入布局的设备。"
+            : $"{selected.Name} 在本机{sideName}（{(selected.Online ? "在线" : "离线")}）";
+    }
+
+    private void ReceiveInput(Guid source, InputPacket packet)
+    {
+        if (packet.Type == InputEventType.ReturnControl)
+        {
+            if (_hooks.IsForwarding && (DevicesList.SelectedItem as DeviceInfo)?.Id == source)
+                _hooks.ReturnFromEdge(packet.Value2);
+            return;
+        }
+
+        if (packet.Type == InputEventType.EnterScreen)
+        {
+            if (!Enum.IsDefined((ScreenSide)packet.Value1) || packet.Value2 is < 0 or > 10000) return;
+            if (_hooks.IsForwarding || (_incomingDeviceId is { } owner && owner != source))
+            {
+                _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, Value2: 5000));
+                return;
+            }
+            _injector.ReleaseAll();
+            _incomingDeviceId = source;
+            _incomingCanReturn = packet.Flags == 1;
+            _incomingReturnSide = ScreenGeometry.Opposite((ScreenSide)packet.Value1);
+            _hooks.SetReceiving(true);
+            if (_incomingCanReturn)
+            {
+                // Use an outer monitor so the connection edge is not an internal
+                // boundary between two monitors attached to the same computer.
+                var screens = Forms.Screen.AllScreens;
+                var screen = _incomingReturnSide switch
+                {
+                    ScreenSide.Left => screens.MinBy(s => s.Bounds.Left)!,
+                    ScreenSide.Right => screens.MaxBy(s => s.Bounds.Right)!,
+                    ScreenSide.Top => screens.MinBy(s => s.Bounds.Top)!,
+                    _ => screens.MaxBy(s => s.Bounds.Bottom)!,
+                };
+                var b = screen.Bounds;
+                _incomingScreen = new ScreenGeometry(b.X, b.Y, b.Width, b.Height);
+                var position = _incomingScreen.Position(_incomingReturnSide, packet.Value2);
+                NativeMethods.SetCursorPos(position.X, position.Y);
+            }
+            return;
+        }
+
+        if (_incomingDeviceId != source) return;
+        try
+        {
+            _injector.Apply(packet);
+            if (packet.Type == InputEventType.ReleaseAll)
+            {
+                EndIncomingControl();
+            }
+            else if (_incomingCanReturn && packet.Type == InputEventType.MouseMove
+                && ScreenGeometry.MovingOut(_incomingReturnSide, packet.Value1, packet.Value2)
+                && NativeMethods.GetCursorPos(out var cursor)
+                && _incomingScreen.AtEdge(_incomingReturnSide, cursor.X, cursor.Y))
+            {
+                var fraction = _incomingScreen.Fraction(_incomingReturnSide, cursor.X, cursor.Y);
+                EndIncomingControl();
+                _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, Value2: fraction));
+            }
+        }
+        catch (Exception ex)
+        {
+            EndIncomingControl();
+            _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, Value2: 5000));
+            DetailStatusText.Text = $"接收控制失败：{ex.Message}";
+        }
+    }
+
+    private void EndIncomingControl()
+    {
+        _incomingDeviceId = null;
+        _incomingCanReturn = false;
+        _hooks.SetReceiving(false);
+        _injector.ReleaseAll();
     }
 
     private void StartWithWindows_Changed(object sender, RoutedEventArgs e)
@@ -283,6 +425,7 @@ public partial class MainWindow : Window
         _refreshTimer.Stop();
         _hooks.Dispose();
         _connection?.Dispose();
+        _injector.ReleaseAll();
         _api.Dispose();
         _identity.Dispose();
         _trayIcon.Visible = false;
