@@ -7,7 +7,9 @@
         issuer acme {
             dir https://acme-v02.api.letsencrypt.org/directory
             profile shortlived
+            disable_http_challenge
         }
     }
+
     reverse_proxy relay:8080
 }
