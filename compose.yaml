@@ -1,0 +1,31 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      DUOTRACK_DATA_DIR: /data
+    expose:
+      - "8080"
+    volumes:
+      - duotrack_data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - relay
+    environment:
+      DUOTRACK_DOMAIN: ${DUOTRACK_DOMAIN:?set DUOTRACK_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  duotrack_data:
+  caddy_data:
+  caddy_config:
