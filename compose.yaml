@@ -17,7 +17,6 @@ services:
     environment:
       DUOTRACK_DOMAIN: ${DUOTRACK_DOMAIN:?set DUOTRACK_DOMAIN}
     ports:
-      - "80:80"
       - "443:443"
       - "443:443/udp"
     volumes:
