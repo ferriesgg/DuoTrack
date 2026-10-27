@@ -19,7 +19,7 @@
 要求：
 
 - 一台安装了 Docker Engine 和 Docker Compose 的 Linux 服务器
-- 一个解析到服务器公网 IP 的域名
+- 一个解析到服务器的域名，或者服务器的固定公网 IP
 - 公网开放 TCP 80、TCP/UDP 443
 
 上传本目录到服务器，然后执行：
@@ -27,15 +27,15 @@
 ```bash
 cd DuoTrack
 chmod +x install.sh
-./install.sh duotrack.example.com
+./install.sh 43.139.208.28
 ```
 
-安装脚本会保存域名、构建中继服务并启动内置 Caddy。Caddy 自动申请和续期 HTTPS 证书；SQLite 数据库、设备身份和配对关系存放在 Docker 数据卷中。
+安装脚本会保存域名或公网 IP、构建中继服务并启动内置 Caddy。Caddy 使用 Let’s Encrypt 的短期证书配置，自动申请和续期域名或公网 IP 的 HTTPS 证书；SQLite 数据库、设备身份和配对关系存放在 Docker 数据卷中。
 
 验证：
 
 ```bash
-curl https://duotrack.example.com/health
+curl https://43.139.208.28/health
 docker compose ps
 docker compose logs --tail=100
 ```
@@ -55,7 +55,7 @@ docker compose up -d --build
 ## 客户端使用
 
 1. 在两台电脑运行 `DuoTrack.Client.exe`。
-2. 填写同一个服务器地址，例如 `https://duotrack.example.com`，设置电脑名称，点击“保存并连接”。地址只需填写一次。
+2. 填写同一个服务器地址，例如 `https://43.139.208.28`，设置电脑名称，点击“保存并连接”。地址只需填写一次。
 3. 在第一台点击“生成配对码”。
 4. 在第二台输入这组 6 位配对码并点击“使用配对码连接”。
 5. 刷新设备列表，选择在线设备并点击“控制”。

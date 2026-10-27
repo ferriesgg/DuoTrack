@@ -2,7 +2,8 @@
 set -eu
 
 if [ "$#" -ne 1 ]; then
-  echo "Usage: ./install.sh duotrack.example.com"
+  echo "Usage: ./install.sh <domain-or-public-ip>"
+  echo "Example: ./install.sh 43.139.208.28"
   exit 1
 fi
 

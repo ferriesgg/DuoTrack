@@ -1,3 +1,13 @@
+{
+    default_sni {$DUOTRACK_DOMAIN}
+}
+
 {$DUOTRACK_DOMAIN} {
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            profile shortlived
+        }
+    }
     reverse_proxy relay:8080
 }

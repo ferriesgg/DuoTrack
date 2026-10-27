@@ -10,7 +10,7 @@ services:
       - duotrack_data:/data
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.7-alpine
     restart: unless-stopped
     depends_on:
       - relay
