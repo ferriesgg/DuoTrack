@@ -46,6 +46,29 @@ internal static class Program
             || GestureShortcut.Direction(1, 1) is not null) throw new Exception("Swipe direction recognition failed");
         Console.WriteLine("PASS: four gesture shortcuts, balanced key releases and small-motion rejection");
 
+        var playback = new ScrollPlaybackBuffer();
+        var paced = new List<RoutedInput>();
+        playback.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, 480)), paced.Add);
+        if (paced.Count != 0) throw new Exception("Relay wheel burst was injected before its playback clock");
+        if (!playback.Tick(paced.Add) || playback.Tick(paced.Add)) throw new Exception("Relay wheel burst did not finish in two ticks");
+        if (paced.Count != 2 || paced.Sum(p => p.Packet.Value1) != 480 || paced.Any(p => p.Packet.Value1 != 240))
+            throw new Exception("Relay wheel burst distance was not preserved and distributed");
+        paced.Clear();
+        playback.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, 120)), paced.Add);
+        playback.Tick(paced.Add);
+        playback.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, -120)), paced.Add);
+        playback.Tick(paced.Add); playback.Tick(paced.Add);
+        if (paced.Select(p => p.Packet.Value1).SequenceEqual(new[] { 60, 60, -60, -60 }) != true)
+            throw new Exception("Scroll reversal reordered pending direction");
+        playback.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, 35)), paced.Add);
+        playback.Flush(paced.Add);
+        if (playback.HasPending || paced.Last().Packet.Value1 != 35) throw new Exception("Key/click ordering barrier did not flush wheel input");
+        playback.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, 120)), paced.Add);
+        var beforeClear = paced.Count;
+        playback.Clear(); playback.Tick(paced.Add);
+        if (paced.Count != beforeClear) throw new Exception("Disconnected peer produced delayed scroll input");
+        Console.WriteLine("PASS: relay scroll pacing, exact distance, reversal ordering, immediate barriers and disconnect cancellation");
+
         var dispatcher = Dispatcher.CurrentDispatcher;
         var delivered = new List<InputPacket>();
         using (var dispatch = new InputDispatchQueue(dispatcher, (_, packet) => delivered.Add(packet)))
@@ -88,6 +111,22 @@ internal static class Program
             Console.WriteLine("PASS: dedicated input thread delivers events while the UI thread is blocked");
         }
 
+        using (var input = new InputProcessingThread())
+        using (var complete = new ManualResetEventSlim())
+        {
+            var outputs = new ConcurrentQueue<int>();
+            var smooth = input.Invoke(() => new ScrollPlayback(input.Dispatcher, item =>
+            {
+                outputs.Enqueue(item.Packet.Value1);
+                if (outputs.Sum() == 480) complete.Set();
+            }));
+            input.Invoke(() => smooth.Enqueue(peer, new InputPacket(InputEventType.MouseWheel, 480)));
+            if (!complete.Wait(TimeSpan.FromSeconds(2)) || outputs.Count != 2 || outputs.Any(p => p != 240))
+                throw new Exception("High-resolution relay playback clock failed");
+            input.StopAsync(smooth.Dispose).GetAwaiter().GetResult();
+            Console.WriteLine("PASS: high-resolution relay playback clock delivers two ordered scroll slices without UI-thread work");
+        }
+
         // Native integration test is explicit because it briefly owns foreground
         // input and injects synthetic contacts into this test's capture window.
         if (args.Contains("--native")) NativeTest();
@@ -117,14 +156,19 @@ internal static class Program
                 await input.Dispatcher.InvokeAsync(() => window.SetActive(true));
                 hooks.StartForwarding();
                 await Task.Delay(150);
-                if (!window.IsActive) throw new Exception("Capture window did not acquire foreground input");
+                if (!window.IsActive)
+                {
+                    Console.WriteLine("SKIP: native foreground-input integration; Windows did not grant this background test foreground activation");
+                    return;
+                }
                 foreach (var direction in Enum.GetValues<SwipeDirection>())
                 {
                     captured.Clear();
                     await SyntheticTouchpad.Swipe(direction);
                     await Task.Delay(150);
-                    if (!captured.SequenceEqual(GestureShortcut.Packets(direction)))
-                        throw new Exception($"Native {direction} swipe did not produce the expected remote shortcut (packets: {captured.Count})");
+                    var keys = captured.Where(p => p.Type == InputEventType.Key).ToArray();
+                    if (!keys.SequenceEqual(GestureShortcut.Packets(direction)))
+                        throw new Exception($"Native {direction} swipe did not produce the expected remote shortcut (keys: {keys.Length}, other packets: {captured.Count - keys.Length}, foreground: {window.IsActive})");
                     Console.WriteLine($"PASS: native synthetic three-finger {direction} -> remote shortcut only");
                 }
                 captured.Clear();

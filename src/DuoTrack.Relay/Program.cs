@@ -36,8 +36,10 @@ repository.Initialize();
 var sessions = new SessionStore();
 var challenges = new ConcurrentDictionary<Guid, PendingChallenge>();
 var connections = new ConnectionRegistry();
+var authorization = new PairAuthorizationCache(repository.ArePairedAsync);
 
 var app = builder.Build();
+app.Lifetime.ApplicationStopped.Register(authorization.Dispose);
 app.UseRateLimiter();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
 
@@ -140,6 +142,7 @@ app.MapPost("/api/pairing/join", async (HttpContext context, JoinPairingRequest 
     }
 
     var pairedDevice = await repository.JoinPairingAsync(deviceId, request.Code.Replace(" ", string.Empty));
+    if (pairedDevice is not null) authorization.Paired(deviceId, pairedDevice.Id);
     return pairedDevice is null
         ? Results.BadRequest(new { error = "invalid-or-expired-code" })
         : Results.Ok(new DeviceResponse(pairedDevice.Id, pairedDevice.Name, connections.IsOnline(pairedDevice.Id), pairedDevice.PublicKey));
@@ -154,7 +157,9 @@ app.Map("/connect", async context =>
         return;
     }
 
-    using var socket = await context.WebSockets.AcceptWebSocketAsync();
+    var protocol = context.WebSockets.WebSocketRequestedProtocols.Contains(RelayWire.BatchSubProtocol)
+        ? RelayWire.BatchSubProtocol : null;
+    using var socket = await context.WebSockets.AcceptWebSocketAsync(protocol);
     var endpoint = new RelayEndpoint(deviceId, socket);
     if (!connections.TryAttach(endpoint))
     {
@@ -174,14 +179,28 @@ app.Map("/connect", async context =>
                 break;
             }
 
-            if (result.MessageType != WebSocketMessageType.Binary || !result.EndOfMessage ||
-                !RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var targetId, out var packet))
+            if (result.MessageType != WebSocketMessageType.Binary || !result.EndOfMessage)
             {
                 await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "Invalid input message", context.RequestAborted);
                 break;
             }
 
-            if (!await repository.ArePairedAsync(deviceId, targetId))
+            if (endpoint.SupportsBatch && RelayWire.TryDecodePing(buffer.AsSpan(0, result.Count), out _))
+            {
+                await endpoint.SendAsync(buffer.AsMemory(0, result.Count), context.RequestAborted);
+                continue;
+            }
+
+            Guid targetId;
+            InputPacket[] packets;
+            if (RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out targetId, out var packet)) packets = [packet];
+            else if (!endpoint.SupportsBatch || !RelayWire.TryDecodeBatch(buffer.AsSpan(0, result.Count), out targetId, out packets))
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "Invalid input message", context.RequestAborted);
+                break;
+            }
+
+            if (!await authorization.IsAllowedAsync(deviceId, targetId))
             {
                 continue;
             }
@@ -190,7 +209,7 @@ app.Map("/connect", async context =>
             {
                 // Client -> relay carries the destination; relay -> client carries
                 // the authenticated source so a screen can return control to it.
-                await target.SendAsync(RelayWire.EncodeInput(deviceId, packet), context.RequestAborted);
+                await target.SendPacketsAsync(deviceId, packets, context.RequestAborted);
             }
         }
     }
@@ -204,7 +223,7 @@ app.Map("/connect", async context =>
     finally
     {
         connections.Detach(endpoint);
-        var release = new InputPacket(InputEventType.ReleaseAll);
+        var release = new InputPacket(InputEventType.ReleaseAll, Flags: InputPacket.DisconnectedReleaseFlag);
         foreach (var peer in await repository.GetPairedDevicesAsync(deviceId))
         {
             if (connections.TryGet(peer.Id, out var target))
@@ -296,6 +315,22 @@ sealed class RelayEndpoint(Guid deviceId, WebSocket socket)
 {
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     public Guid DeviceId { get; } = deviceId;
+    public bool SupportsBatch => socket.SubProtocol == RelayWire.BatchSubProtocol;
+
+    public async Task SendPacketsAsync(Guid source, InputPacket[] packets, CancellationToken token)
+    {
+        await _sendLock.WaitAsync(token);
+        try
+        {
+            if (socket.State != WebSocketState.Open) return;
+            if (SupportsBatch && packets.Length > 1)
+                await socket.SendAsync(RelayWire.EncodeBatch(source, packets), WebSocketMessageType.Binary, true, token);
+            else
+                foreach (var packet in packets)
+                    await socket.SendAsync(RelayWire.EncodeInput(source, packet), WebSocketMessageType.Binary, true, token);
+        }
+        finally { _sendLock.Release(); }
+    }
 
     public async Task SendAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {

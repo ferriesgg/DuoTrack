@@ -31,6 +31,7 @@ public readonly record struct InputPacket(
     uint Flags = 0)
 {
     public const int WireSize = 13;
+    public const uint DisconnectedReleaseFlag = 1;
 
     public byte[] Encode()
     {
@@ -68,6 +69,10 @@ public readonly record struct InputPacket(
 public static class RelayWire
 {
     public const byte InputMessage = 1;
+    public const byte BatchMessage = 2;
+    public const byte PingMessage = 3;
+    public const string BatchSubProtocol = "duotrack.v2";
+    public const int MaximumBatch = 64;
     public const int InputWireSize = 1 + 16 + InputPacket.WireSize;
 
     public static byte[] EncodeInput(Guid targetDeviceId, InputPacket packet)
@@ -90,5 +95,45 @@ public static class RelayWire
 
         targetDeviceId = new Guid(data.Slice(1, 16));
         return InputPacket.TryDecode(data.Slice(17), out packet);
+    }
+
+    public static byte[] EncodeBatch(Guid peer, ReadOnlySpan<InputPacket> packets)
+    {
+        if (packets.Length is < 1 or > MaximumBatch) throw new ArgumentOutOfRangeException(nameof(packets));
+        var buffer = new byte[19 + packets.Length * InputPacket.WireSize];
+        buffer[0] = BatchMessage;
+        peer.TryWriteBytes(buffer.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(17), (ushort)packets.Length);
+        for (var i = 0; i < packets.Length; i++) packets[i].WriteTo(buffer.AsSpan(19 + i * InputPacket.WireSize));
+        return buffer;
+    }
+
+    public static bool TryDecodeBatch(ReadOnlySpan<byte> data, out Guid peer, out InputPacket[] packets)
+    {
+        peer = default; packets = [];
+        if (data.Length < 19 || data[0] != BatchMessage) return false;
+        var count = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(17, 2));
+        if (count is < 1 or > MaximumBatch || data.Length != 19 + count * InputPacket.WireSize) return false;
+        var decoded = new InputPacket[count];
+        for (var i = 0; i < count; i++)
+            if (!InputPacket.TryDecode(data.Slice(19 + i * InputPacket.WireSize, InputPacket.WireSize), out decoded[i])) return false;
+        peer = new Guid(data.Slice(1, 16));
+        packets = decoded;
+        return true;
+    }
+
+    public static byte[] EncodePing(long timestamp)
+    {
+        var buffer = new byte[9]; buffer[0] = PingMessage;
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(1), timestamp);
+        return buffer;
+    }
+
+    public static bool TryDecodePing(ReadOnlySpan<byte> data, out long timestamp)
+    {
+        timestamp = 0;
+        if (data.Length != 9 || data[0] != PingMessage) return false;
+        timestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(1));
+        return true;
     }
 }

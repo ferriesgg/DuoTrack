@@ -89,7 +89,9 @@ using var bridgeLanB = new LanPeerTransport(second, apiB.TrustedPeers, 0, false)
 using var bridgeA = new BridgeConnection(apiA, "A", first, bridgeLanA);
 using var bridgeB = new BridgeConnection(apiB, "B", second, bridgeLanB);
 var bridgePackets = new ConcurrentQueue<InputPacket>();
+var directContexts = new ConcurrentQueue<bool>();
 bridgeB.PacketReceived += (_, packet) => bridgePackets.Enqueue(packet);
+bridgeB.InputReceived += (_, _, direct) => directContexts.Enqueue(direct);
 bridgeA.Start(); bridgeB.Start();
 await bridgeLanA.ConnectPeerAsync(second.DeviceId, new IPEndPoint(IPAddress.Loopback, bridgeLanB.ListenPort));
 await WaitFor(() => bridgeA.IsConnected && bridgeB.IsConnected, "Offline bridge did not become connected");
@@ -99,6 +101,8 @@ bridgeA.Send(enter);
 bridgeA.Send(new InputPacket(InputEventType.Key, 65));
 bridgeA.Send(new InputPacket(InputEventType.ReleaseAll));
 await WaitFor(() => bridgePackets.Count == 3, "Offline bridge input failed");
+await WaitFor(() => directContexts.Count == 3, "Transport context was not delivered");
+if (directContexts.Any(d => !d)) throw new Exception("LAN input was mislabeled as relay input");
 if (bridgeA.GetDevices().Single().ConnectionMode != "局域网直连") throw new Exception("Wrong UI route label");
 Console.WriteLine("PASS: actual BridgeConnection controls a cached peer while public server is unreachable");
 while (bridgePackets.TryDequeue(out _)) { }
@@ -208,4 +212,53 @@ if (args.Length > 0)
     await WaitFor(() => mixedPackets.Any(p => p.Type == InputEventType.MouseMove && p.Value1 == 9), "Relay fallback after direct connection loss failed");
     if (mixedA.GetDevices().Single().ConnectionMode != "公网中继") throw new Exception("Fallback route label failed");
     Console.WriteLine("PASS: actual relay routing, LAN preference, active direct disconnect and next-session relay fallback");
+    await WaitFor(() => mixedA.RelayRttMs > 0 && mixedB.RelayRttMs > 0, "Relay RTT echo was not negotiated");
+    while (mixedPackets.TryDequeue(out _)) { }
+    mixedA.Send(enter);
+    for (var i = 0; i < 2048; i++) mixedA.Send(new InputPacket(InputEventType.MouseMove, i, -i));
+    mixedA.Send(new InputPacket(InputEventType.ReleaseAll));
+    await WaitFor(() => mixedPackets.Any(p => p.Type == InputEventType.ReleaseAll), "Relay batched movement did not finish");
+    var relayMoves = mixedPackets.Where(p => p.Type == InputEventType.MouseMove).ToArray();
+    if (relayMoves.Length != 2048 || relayMoves.Where((p, i) => p.Value1 != i || p.Value2 != -i).Any())
+        throw new Exception("Relay batch forwarding changed input ordering");
+    Console.WriteLine($"PASS: negotiated relay batches preserve 2,048 movement events; relay RTT={mixedA.RelayRttMs:F2}ms");
+
+    using var playbackThread = new InputProcessingThread();
+    var played = new ConcurrentQueue<(long At, InputPacket Packet)>();
+    using var finished = new ManualResetEventSlim();
+    var smoothing = playbackThread.Invoke(() => new ScrollPlayback(playbackThread.Dispatcher,
+        item => played.Enqueue((Stopwatch.GetTimestamp(), item.Packet))));
+    using var playbackInput = new InputDispatchQueue(playbackThread.Dispatcher, item =>
+    {
+        if (item.Packet.Type == InputEventType.MouseWheel && item.Direct != true) smoothing.Enqueue(item.Peer, item.Packet);
+        else
+        {
+            smoothing.Flush();
+            played.Enqueue((Stopwatch.GetTimestamp(), item.Packet));
+            if (item.Packet.Type == InputEventType.ReleaseAll) finished.Set();
+        }
+    });
+    Action<Guid, InputPacket, bool> receiver = (id, packet, direct) => playbackInput.Enqueue(id, packet, direct);
+    mixedB.InputReceived += receiver;
+    mixedA.Send(enter);
+    for (var wave = 0; wave < 20; wave++)
+    {
+        for (var i = 0; i < 8; i++) mixedA.Send(new InputPacket(InputEventType.MouseWheel, 15));
+        await Task.Delay(wave % 5 == 4 ? 24 : 8); // Deliberately uneven relay bursts.
+    }
+    mixedA.Send(new InputPacket(InputEventType.Key, 65));
+    mixedA.Send(new InputPacket(InputEventType.Key, 65, Flags: NativeMethods.KeyeventfKeyUp));
+    mixedA.Send(new InputPacket(InputEventType.ReleaseAll));
+    if (!finished.Wait(TimeSpan.FromSeconds(3))) throw new Exception("Continuous relay scroll did not drain");
+    var completed = played.ToArray();
+    if (completed.Where(p => p.Packet.Type == InputEventType.MouseWheel).Sum(p => (long)p.Packet.Value1) != 2400)
+        throw new Exception("Relay playback changed total scroll distance");
+    var keyIndex = Array.FindIndex(completed, p => p.Packet.Type == InputEventType.Key);
+    if (completed.Skip(keyIndex).Any(p => p.Packet.Type == InputEventType.MouseWheel)) throw new Exception("Delayed wheel overtook keyboard input");
+    var countAfterRelease = played.Count;
+    await Task.Delay(50);
+    if (played.Count != countAfterRelease) throw new Exception("Wheel playback continued after release");
+    mixedB.InputReceived -= receiver;
+    playbackThread.StopAsync(smoothing.Dispose).GetAwaiter().GetResult();
+    Console.WriteLine("PASS: 20 uneven relay scroll bursts preserve 2,400 wheel units, key order and no delayed input after release");
 }

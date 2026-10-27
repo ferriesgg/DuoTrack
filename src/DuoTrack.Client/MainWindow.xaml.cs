@@ -16,6 +16,7 @@ public partial class MainWindow : Window
     private readonly InputHookManager _hooks;
     private readonly InputProcessingThread _inputThread;
     private readonly RemoteInputWindow _remoteInput;
+    private readonly ScrollPlayback _scrollPlayback;
     private InputDispatchQueue? _inputDispatch;
     private readonly ObservableCollection<DeviceInfo> _devices = [];
     private readonly DispatcherTimer _refreshTimer;
@@ -37,6 +38,16 @@ public partial class MainWindow : Window
         _inputThread = new InputProcessingThread();
         _hooks = _inputThread.Invoke(() => new InputHookManager());
         _remoteInput = _inputThread.Invoke(() => new RemoteInputWindow());
+        _scrollPlayback = _inputThread.Invoke(() => new ScrollPlayback(_inputThread.Dispatcher, item =>
+        {
+            if (_incomingDeviceId != item.Peer || _connection?.IsConnected != true) return;
+            try { _injector.Apply(item.Packet); }
+            catch (Exception ex)
+            {
+                EndIncomingControl();
+                Dispatcher.BeginInvoke(() => DetailStatusText.Text = $"滚动输入失败：{ex.Message}");
+            }
+        }) { Enabled = _settings.RelayScrollSmoothing });
         _remoteInput.PacketCaptured += packet => _connection?.Send(packet);
         _remoteInput.CaptureError += message => Dispatcher.BeginInvoke(() => DetailStatusText.Text = message);
         GestureStatusText.Text = _remoteInput.GestureStatus;
@@ -63,6 +74,7 @@ public partial class MainWindow : Window
         DeviceNameBox.Text = _settings.DeviceName;
         StartWithWindowsCheck.IsChecked = _settings.StartWithWindows;
         EdgeSwitchCheck.IsChecked = _settings.EdgeSwitchEnabled;
+        RelaySmoothingCheck.IsChecked = _settings.RelayScrollSmoothing;
         _hooks.EdgeSwitchEnabled = _settings.EdgeSwitchEnabled;
         _hooks.RemoteScreenSide = _settings.RemoteScreenSide;
         UpdateLayoutPreview();
@@ -127,12 +139,12 @@ public partial class MainWindow : Window
                 if (connection.CurrentTargetDeviceId == source) _hooks.StopForwarding();
                 Dispatcher.BeginInvoke(() => DetailStatusText.Text = "连接线路中断，已释放按键；再次跨屏会自动选择可用线路。");
             });
-            _inputDispatch = new InputDispatchQueue(_inputThread.Dispatcher, (source, packet) =>
+            _inputDispatch = new InputDispatchQueue(_inputThread.Dispatcher, item =>
             {
                 if (ReferenceEquals(connection, _connection) && connection.IsConnected)
-                    ReceiveInput(source, packet);
+                    ReceiveInput(item.Peer, item.Packet, item.Direct == true);
             });
-            connection.PacketReceived += _inputDispatch.Enqueue;
+            connection.InputReceived += (source, packet, direct) => _inputDispatch.Enqueue(source, packet, direct);
             _connection.ConnectionChanged += connected => Dispatcher.BeginInvoke(async () =>
             {
                 if (!ReferenceEquals(connection, _connection)) return;
@@ -199,6 +211,12 @@ public partial class MainWindow : Window
             var sent = _connection.Performance;
             var received = _inputDispatch?.Performance ?? default;
             PerformanceStatusText.Text = $"本机排队 P95：发送 {sent.P95Ms:F1} ms / 接收 {received.P95Ms:F1} ms（不含网络）";
+            if (_connection.IsRelayConnected)
+            {
+                var rtt = _connection.RelayRttMs;
+                RelayNetworkText.Text = rtt > 0 ? $"中继往返约 {rtt:F0} ms，峰值 {_connection.RelayPeakRttMs:F0} ms（不含平滑播放）" : "中继往返测量需服务器支持新版协议。";
+            }
+            else RelayNetworkText.Text = "局域网直连时不启用公网滚动缓冲。";
         }
         catch (Exception ex)
         {
@@ -337,8 +355,15 @@ public partial class MainWindow : Window
             : $"{selected.Name} 在本机{sideName}（{(selected.Online ? selected.ConnectionMode ?? "在线" : "离线")}）";
     }
 
-    private void ReceiveInput(Guid source, InputPacket packet)
+    private void ReceiveInput(Guid source, InputPacket packet, bool direct)
     {
+        var disconnected = packet.Type == InputEventType.ReleaseAll && packet.Flags == InputPacket.DisconnectedReleaseFlag;
+        if (packet.Type != InputEventType.MouseWheel && _incomingDeviceId == source)
+        {
+            if (disconnected) _scrollPlayback.Clear();
+            else _scrollPlayback.Flush();
+        }
+        if (disconnected && _hooks.IsForwarding && _connection?.CurrentTargetDeviceId == source) _hooks.StopForwarding();
         if (packet.Type == InputEventType.ReturnControl)
         {
             if (_hooks.IsForwarding && _connection?.CurrentTargetDeviceId == source)
@@ -382,6 +407,11 @@ public partial class MainWindow : Window
         if (_incomingDeviceId != source) return;
         try
         {
+            if (packet.Type == InputEventType.MouseWheel && _scrollPlayback.Enabled && !direct)
+            {
+                _scrollPlayback.Enqueue(source, packet);
+                return;
+            }
             if (_incomingCanReturn && packet.Type == InputEventType.MouseMove
                 && NativeMethods.GetCursorPos(out var current))
             {
@@ -420,10 +450,19 @@ public partial class MainWindow : Window
     private void EndIncomingControl()
     {
         if (!_inputThread.Dispatcher.CheckAccess()) { _inputThread.Invoke(EndIncomingControl); return; }
+        _scrollPlayback.Clear();
         _incomingDeviceId = null;
         _incomingCanReturn = false;
         _hooks.SetReceiving(false);
         _injector.ReleaseAll();
+    }
+
+    private void RelaySmoothing_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initializing) return;
+        _settings.RelayScrollSmoothing = RelaySmoothingCheck.IsChecked == true;
+        _inputThread.Invoke(() => _scrollPlayback.Enabled = _settings.RelayScrollSmoothing);
+        _settings.Save();
     }
 
     private void StartWithWindows_Changed(object sender, RoutedEventArgs e)
@@ -489,7 +528,7 @@ public partial class MainWindow : Window
             try { _hooks.Dispose(); }
             finally
             {
-                try { _remoteInput.Dispose(); }
+                try { _scrollPlayback.Dispose(); _remoteInput.Dispose(); }
                 finally { _injector.ReleaseAll(); }
             }
         });
