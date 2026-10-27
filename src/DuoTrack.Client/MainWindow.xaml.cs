@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private bool _isExiting;
     private bool _initializing = true;
     private bool _refreshing;
+    private bool _updatingDevices;
 
     public MainWindow()
     {
@@ -117,12 +118,21 @@ public partial class MainWindow : Window
         {
             var selectedId = (DevicesList.SelectedItem as DeviceInfo)?.Id;
             var devices = await _api.GetDevicesAsync(CancellationToken.None);
-            _devices.Clear();
-            foreach (var device in devices) _devices.Add(device);
-            if (selectedId is { } id)
+            _updatingDevices = true;
+            try
             {
-                DevicesList.SelectedItem = _devices.FirstOrDefault(item => item.Id == id);
+                _devices.Clear();
+                foreach (var device in devices) _devices.Add(device);
+                DevicesList.SelectedItem = selectedId is { } id
+                    ? _devices.FirstOrDefault(item => item.Id == id)
+                    : null;
             }
+            finally
+            {
+                _updatingDevices = false;
+            }
+
+            ApplyDeviceSelection(DevicesList.SelectedItem as DeviceInfo, stopForwarding: false);
         }
         catch (Exception ex)
         {
@@ -171,13 +181,31 @@ public partial class MainWindow : Window
 
     private void DevicesList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        _hooks.StopForwarding();
-        var selected = DevicesList.SelectedItem as DeviceInfo;
+        if (_updatingDevices) return;
+        ApplyDeviceSelection(DevicesList.SelectedItem as DeviceInfo, stopForwarding: true);
+    }
+
+    private void ApplyDeviceSelection(DeviceInfo? selected, bool stopForwarding)
+    {
+        if (stopForwarding)
+        {
+            _hooks.StopForwarding();
+        }
+
         var canControl = selected?.Online == true && _connection?.IsConnected == true;
+        if (!canControl)
+        {
+            _hooks.StopForwarding();
+        }
+
         _connection?.SetTarget(canControl ? selected!.Id : null);
         _hooks.SetCanForward(canControl);
         ControlButton.IsEnabled = canControl;
-        ControlButton.Content = canControl ? $"控制 {selected!.Name}" : "请选择一台在线设备";
+        ControlButton.Content = _hooks.IsForwarding
+            ? "停止控制并返回本机"
+            : canControl
+                ? $"控制 {selected!.Name}"
+                : "请选择一台在线设备";
     }
 
     private void Control_Click(object sender, RoutedEventArgs e)
