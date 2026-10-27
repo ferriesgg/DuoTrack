@@ -12,4 +12,10 @@
       <supportedOS Id="{4f476546-937d-4f5a-a525-0fc83cb1e5da}" />
     </application>
   </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <highResolutionScrollingAware xmlns="http://schemas.microsoft.com/SMI/2013/WindowsSettings">true</highResolutionScrollingAware>
+      <ultraHighResolutionScrollingAware xmlns="http://schemas.microsoft.com/SMI/2013/WindowsSettings">true</ultraHighResolutionScrollingAware>
+    </windowsSettings>
+  </application>
 </assembly>

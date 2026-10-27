@@ -35,6 +35,7 @@ internal static class NativeMethods
     internal const uint LlkhfInjected = 0x10;
     internal const uint LlkhfUp = 0x80;
     internal const uint LlmhfInjected = 0x00000001;
+    internal const nuint DuoTrackInputTag = 0x4454524B;
 
     internal const uint InputMouse = 0;
     internal const uint InputKeyboard = 1;
@@ -88,6 +89,17 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    internal static extern nint GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetForegroundWindow(nint window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern nint DefWindowProc(nint window, int message, nint wParam, nint lParam);
+
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct Point

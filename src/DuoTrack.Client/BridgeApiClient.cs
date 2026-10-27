@@ -6,12 +6,13 @@ using System.Text;
 
 namespace DuoTrack.Client;
 
-internal sealed class BridgeApiClient(DeviceIdentity identity) : IDisposable
+internal sealed class BridgeApiClient(DeviceIdentity identity, string? peerCachePath = null) : IDisposable
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
     private Uri? _baseUri;
 
     public string? SessionToken { get; private set; }
+    public TrustedPeerStore TrustedPeers { get; private set; } = null!;
 
     public void Configure(string serverUrl)
     {
@@ -20,6 +21,7 @@ internal sealed class BridgeApiClient(DeviceIdentity identity) : IDisposable
         {
             throw new ArgumentException("请输入有效的服务器地址，例如 https://duotrack.example.com");
         }
+        if (_baseUri != uri) TrustedPeers = new TrustedPeerStore(uri.AbsoluteUri.TrimEnd('/'), peerCachePath);
         _baseUri = uri;
     }
 
@@ -49,8 +51,9 @@ internal sealed class BridgeApiClient(DeviceIdentity identity) : IDisposable
     public async Task<IReadOnlyList<DeviceInfo>> GetDevicesAsync(CancellationToken cancellationToken)
     {
         EnsureAuthenticated();
-        return await _http.GetFromJsonAsync<List<DeviceInfo>>(BuildUri("/api/devices"), cancellationToken)
-            ?? [];
+        var devices = await _http.GetFromJsonAsync<List<DeviceInfo>>(BuildUri("/api/devices"), cancellationToken) ?? [];
+        TrustedPeers.Update(devices, replace: true);
+        return devices;
     }
 
     public async Task<PairingCodeResponse> CreatePairingCodeAsync(CancellationToken cancellationToken)
@@ -70,8 +73,10 @@ internal sealed class BridgeApiClient(DeviceIdentity identity) : IDisposable
         {
             throw new InvalidOperationException("配对码无效、已过期或不能与本机配对。");
         }
-        return await response.Content.ReadFromJsonAsync<DeviceInfo>(cancellationToken: cancellationToken)
+        var device = await response.Content.ReadFromJsonAsync<DeviceInfo>(cancellationToken: cancellationToken)
             ?? throw new InvalidDataException("服务器没有返回配对设备。");
+        TrustedPeers.Update([device], replace: false);
+        return device;
     }
 
     public Uri BuildWebSocketUri()

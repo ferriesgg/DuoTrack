@@ -35,11 +35,17 @@ public readonly record struct InputPacket(
     public byte[] Encode()
     {
         var buffer = new byte[WireSize];
-        buffer[0] = (byte)Type;
-        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(1, 4), Value1);
-        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(5, 4), Value2);
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(9, 4), Flags);
+        WriteTo(buffer);
         return buffer;
+    }
+
+    public void WriteTo(Span<byte> buffer)
+    {
+        if (buffer.Length < WireSize) throw new ArgumentException("Input packet buffer is too short", nameof(buffer));
+        buffer[0] = (byte)Type;
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(1, 4), Value1);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(5, 4), Value2);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.Slice(9, 4), Flags);
     }
 
     public static bool TryDecode(ReadOnlySpan<byte> data, out InputPacket packet)
@@ -69,7 +75,7 @@ public static class RelayWire
         var buffer = new byte[InputWireSize];
         buffer[0] = InputMessage;
         targetDeviceId.TryWriteBytes(buffer.AsSpan(1, 16));
-        packet.Encode().CopyTo(buffer, 17);
+        packet.WriteTo(buffer.AsSpan(17, InputPacket.WireSize));
         return buffer;
     }
 

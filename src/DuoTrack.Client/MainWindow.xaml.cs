@@ -14,11 +14,14 @@ public partial class MainWindow : Window
     private readonly BridgeApiClient _api;
     private readonly WindowsInputInjector _injector = new();
     private readonly InputHookManager _hooks;
+    private readonly InputProcessingThread _inputThread;
+    private readonly RemoteInputWindow _remoteInput;
+    private InputDispatchQueue? _inputDispatch;
     private readonly ObservableCollection<DeviceInfo> _devices = [];
     private readonly DispatcherTimer _refreshTimer;
     private readonly Forms.NotifyIcon _trayIcon;
     private BridgeConnection? _connection;
-    private bool _isExiting;
+    private volatile bool _isExiting;
     private bool _initializing = true;
     private bool _refreshing;
     private bool _updatingDevices;
@@ -31,10 +34,29 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _api = new BridgeApiClient(_identity);
-        _hooks = new InputHookManager();
+        _inputThread = new InputProcessingThread();
+        _hooks = _inputThread.Invoke(() => new InputHookManager());
+        _remoteInput = _inputThread.Invoke(() => new RemoteInputWindow());
+        _remoteInput.PacketCaptured += packet => _connection?.Send(packet);
+        _remoteInput.CaptureError += message => Dispatcher.BeginInvoke(() => DetailStatusText.Text = message);
+        GestureStatusText.Text = _remoteInput.GestureStatus;
         if (!Enum.IsDefined(_settings.RemoteScreenSide)) _settings.RemoteScreenSide = ScreenSide.Right;
         _hooks.PacketCaptured += packet => _connection?.Send(packet);
-        _hooks.ForwardingChanged += forwarding => Dispatcher.BeginInvoke(() => UpdateControlState(forwarding));
+        _hooks.ForwardingChanged += forwarding => _inputThread.Dispatcher.BeginInvoke(() =>
+        {
+            if (_isExiting || _hooks.IsForwarding != forwarding) return;
+            try
+            {
+                _remoteInput.SetActive(forwarding);
+                Dispatcher.BeginInvoke(() => UpdateControlState(_hooks.IsForwarding));
+            }
+            catch (Exception ex)
+            {
+                _hooks.StopForwarding();
+                _remoteInput.SetActive(false);
+                Dispatcher.BeginInvoke(() => DetailStatusText.Text = $"输入接管失败：{ex.Message}");
+            }
+        });
 
         DevicesList.ItemsSource = _devices;
         ServerUrlBox.Text = _settings.ServerUrl;
@@ -88,19 +110,35 @@ public partial class MainWindow : Window
             EndIncomingControl();
             _hooks.StopForwarding();
             _connection?.Dispose();
-            _connection = new BridgeConnection(_api, _settings.DeviceName);
+            _inputDispatch?.Dispose();
+            _connection = new BridgeConnection(_api, _settings.DeviceName, _identity);
             var connection = _connection;
-            connection.PacketReceived += (source, packet) => Dispatcher.BeginInvoke(() =>
+            connection.DevicesChanged += () => Dispatcher.BeginInvoke(async () =>
+            {
+                if (!ReferenceEquals(connection, _connection)) return;
+                CreatePairingButton.IsEnabled = connection.IsRelayConnected;
+                JoinPairingButton.IsEnabled = connection.IsRelayConnected;
+                await RefreshDevicesAsync();
+            });
+            connection.PeerConnectionLost += source => _inputThread.Dispatcher.BeginInvoke(() =>
+            {
+                if (!ReferenceEquals(connection, _connection)) return;
+                if (_incomingDeviceId == source) EndIncomingControl();
+                if (connection.CurrentTargetDeviceId == source) _hooks.StopForwarding();
+                Dispatcher.BeginInvoke(() => DetailStatusText.Text = "连接线路中断，已释放按键；再次跨屏会自动选择可用线路。");
+            });
+            _inputDispatch = new InputDispatchQueue(_inputThread.Dispatcher, (source, packet) =>
             {
                 if (ReferenceEquals(connection, _connection) && connection.IsConnected)
                     ReceiveInput(source, packet);
             });
+            connection.PacketReceived += _inputDispatch.Enqueue;
             _connection.ConnectionChanged += connected => Dispatcher.BeginInvoke(async () =>
             {
                 if (!ReferenceEquals(connection, _connection)) return;
                 _hooks.SetConnected(connected);
-                CreatePairingButton.IsEnabled = connected;
-                JoinPairingButton.IsEnabled = connected;
+                CreatePairingButton.IsEnabled = connection.IsRelayConnected;
+                JoinPairingButton.IsEnabled = connection.IsRelayConnected;
                 StatusText.Text = connected ? "● 已连接" : "○ 正在重连";
                 StatusText.Foreground = connected
                     ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(22, 163, 74))
@@ -119,7 +157,10 @@ public partial class MainWindow : Window
                     ControlButton.Content = "等待重新连接";
                 }
             });
-            _connection.StatusChanged += status => Dispatcher.BeginInvoke(() => DetailStatusText.Text = status);
+            _connection.StatusChanged += status => Dispatcher.BeginInvoke(() =>
+            {
+                if (ReferenceEquals(connection, _connection)) DetailStatusText.Text = status;
+            });
             _connection.Start();
             DetailStatusText.Text = "正在连接服务器…";
         }
@@ -130,22 +171,24 @@ public partial class MainWindow : Window
         return Task.CompletedTask;
     }
 
-    private async Task RefreshDevicesAsync()
+    private Task RefreshDevicesAsync()
     {
-        if (_refreshing || _connection?.IsConnected != true) return;
+        if (_refreshing || _connection is null) return Task.CompletedTask;
         _refreshing = true;
         try
         {
-            var devices = await _api.GetDevicesAsync(CancellationToken.None);
+            var devices = _connection.GetDevices();
             var selectedId = (DevicesList.SelectedItem as DeviceInfo)?.Id ?? _settings.LayoutDeviceId;
             _updatingDevices = true;
             try
             {
-                _devices.Clear();
-                foreach (var device in devices) _devices.Add(device);
-                DevicesList.SelectedItem = selectedId is { } id
-                    ? _devices.FirstOrDefault(item => item.Id == id)
-                    : null;
+                if (DeviceListUpdater.Synchronize(_devices, devices))
+                {
+                    DevicesList.SelectedItem = selectedId is { } id
+                        ? _devices.FirstOrDefault(item => item.Id == id)
+                        : null;
+                    UpdateLayoutPreview();
+                }
             }
             finally
             {
@@ -153,7 +196,9 @@ public partial class MainWindow : Window
             }
 
             ApplyDeviceSelection(DevicesList.SelectedItem as DeviceInfo, stopForwarding: false);
-            UpdateLayoutPreview();
+            var sent = _connection.Performance;
+            var received = _inputDispatch?.Performance ?? default;
+            PerformanceStatusText.Text = $"本机排队 P95：发送 {sent.P95Ms:F1} ms / 接收 {received.P95Ms:F1} ms（不含网络）";
         }
         catch (Exception ex)
         {
@@ -163,6 +208,7 @@ public partial class MainWindow : Window
         {
             _refreshing = false;
         }
+        return Task.CompletedTask;
     }
 
     private async void RefreshDevices_Click(object sender, RoutedEventArgs e) => await RefreshDevicesAsync();
@@ -288,15 +334,15 @@ public partial class MainWindow : Window
             ScreenSide.Top => "上方", _ => "下方",
         };
         LayoutDescription.Text = selected is null ? "请选择要放入布局的设备。"
-            : $"{selected.Name} 在本机{sideName}（{(selected.Online ? "在线" : "离线")}）";
+            : $"{selected.Name} 在本机{sideName}（{(selected.Online ? selected.ConnectionMode ?? "在线" : "离线")}）";
     }
 
     private void ReceiveInput(Guid source, InputPacket packet)
     {
         if (packet.Type == InputEventType.ReturnControl)
         {
-            if (_hooks.IsForwarding && (DevicesList.SelectedItem as DeviceInfo)?.Id == source)
-                _hooks.ReturnFromEdge(packet.Value2);
+            if (_hooks.IsForwarding && _connection?.CurrentTargetDeviceId == source)
+                _hooks.ReturnFromEdge(packet.Value2, Math.Clamp(packet.Value1, 0, 10000));
             return;
         }
 
@@ -336,31 +382,44 @@ public partial class MainWindow : Window
         if (_incomingDeviceId != source) return;
         try
         {
+            if (_incomingCanReturn && packet.Type == InputEventType.MouseMove
+                && NativeMethods.GetCursorPos(out var current))
+            {
+                if (_incomingScreen.TryCrossEdge(_incomingReturnSide, current.X, current.Y,
+                    packet.Value1, packet.Value2, out var fraction, out var overshoot))
+                {
+                    EndIncomingControl();
+                    _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, overshoot, fraction));
+                }
+                else
+                {
+                    // The controller's hook already measures cursor motion in
+                    // pixels. Position directly to avoid applying Windows mouse
+                    // acceleration a second time on the receiving computer.
+                    var x = (int)Math.Clamp((long)current.X + packet.Value1, int.MinValue, int.MaxValue);
+                    var y = (int)Math.Clamp((long)current.Y + packet.Value2, int.MinValue, int.MaxValue);
+                    NativeMethods.SetCursorPos(x, y);
+                }
+                return;
+            }
+
             _injector.Apply(packet);
             if (packet.Type == InputEventType.ReleaseAll)
             {
                 EndIncomingControl();
-            }
-            else if (_incomingCanReturn && packet.Type == InputEventType.MouseMove
-                && ScreenGeometry.MovingOut(_incomingReturnSide, packet.Value1, packet.Value2)
-                && NativeMethods.GetCursorPos(out var cursor)
-                && _incomingScreen.AtEdge(_incomingReturnSide, cursor.X, cursor.Y))
-            {
-                var fraction = _incomingScreen.Fraction(_incomingReturnSide, cursor.X, cursor.Y);
-                EndIncomingControl();
-                _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, Value2: fraction));
             }
         }
         catch (Exception ex)
         {
             EndIncomingControl();
             _connection?.SendTo(source, new InputPacket(InputEventType.ReturnControl, Value2: 5000));
-            DetailStatusText.Text = $"接收控制失败：{ex.Message}";
+            Dispatcher.BeginInvoke(() => DetailStatusText.Text = $"接收控制失败：{ex.Message}");
         }
     }
 
     private void EndIncomingControl()
     {
+        if (!_inputThread.Dispatcher.CheckAccess()) { _inputThread.Invoke(EndIncomingControl); return; }
         _incomingDeviceId = null;
         _incomingCanReturn = false;
         _hooks.SetReceiving(false);
@@ -423,9 +482,17 @@ public partial class MainWindow : Window
         }
 
         _refreshTimer.Stop();
-        _hooks.Dispose();
+        _inputDispatch?.Dispose();
         _connection?.Dispose();
-        _injector.ReleaseAll();
+        _ = _inputThread.StopAsync(() =>
+        {
+            try { _hooks.Dispose(); }
+            finally
+            {
+                try { _remoteInput.Dispose(); }
+                finally { _injector.ReleaseAll(); }
+            }
+        });
         _api.Dispose();
         _identity.Dispose();
         _trayIcon.Visible = false;
@@ -436,7 +503,7 @@ public partial class MainWindow : Window
 
     private void EnsureConnected()
     {
-        if (_connection?.IsConnected != true) throw new InvalidOperationException("请先连接服务器。");
+        if (_connection?.IsRelayConnected != true) throw new InvalidOperationException("首次配对需要连接服务器；已配对设备的局域网直连不受影响。");
     }
 
     private static void ShowError(string message) =>

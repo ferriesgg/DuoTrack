@@ -54,6 +54,7 @@ internal sealed class WindowsInputInjector
                 {
                     VirtualKey = checked((ushort)virtualKey),
                     Flags = flags,
+                    ExtraInfo = NativeMethods.DuoTrackInputTag,
                 },
             },
         });
@@ -100,6 +101,7 @@ internal sealed class WindowsInputInjector
                     Dy = dy,
                     MouseData = data,
                     Flags = flags,
+                    ExtraInfo = NativeMethods.DuoTrackInputTag,
                 },
             },
         });

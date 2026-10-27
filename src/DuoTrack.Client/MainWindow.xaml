@@ -85,8 +85,8 @@
                             <Button x:Name="LayoutBottom" Grid.Row="2" Grid.Column="1" Content="↓ 下方" Tag="Bottom" Click="LayoutSide_Click" Padding="4" />
                         </Grid>
                         <TextBlock x:Name="LayoutDescription" TextWrapping="Wrap" Foreground="#2563EB" Margin="0,4,0,8" />
-                        <CheckBox x:Name="EdgeSwitchCheck" Content="鼠标到屏幕边缘时自动切换" Checked="EdgeSwitch_Changed" Unchecked="EdgeSwitch_Changed" />
-                        <TextBlock Text="进入远端后，从连接边缘移回即可返回本机。" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,5,0,0" />
+                        <CheckBox x:Name="EdgeSwitchCheck" Content="像扩展屏一样，用鼠标跨屏切换" Checked="EdgeSwitch_Changed" Unchecked="EdgeSwitch_Changed" />
+                        <TextBlock Text="例如远端在右侧：向右跨入，向左跨回，无需点击按钮。" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,5,0,0" />
                     </StackPanel>
                     <StackPanel Grid.Row="3">
                         <Button x:Name="ControlButton" Content="选择一台在线设备" Click="Control_Click"
@@ -121,6 +121,10 @@
                                   Checked="StartWithWindows_Changed" Unchecked="StartWithWindows_Changed" />
                         <TextBlock x:Name="DetailStatusText" Text="请先填写服务器地址并连接。"
                                    TextWrapping="Wrap" Foreground="#6B7280" Margin="0,12,0,0" />
+                        <TextBlock Text="同一局域网自动优先直连。首次出现防火墙提示时，请允许 DuoTrack 通过专用网络。"
+                                   TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
+                        <TextBlock x:Name="GestureStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
+                        <TextBlock x:Name="PerformanceStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
                     </StackPanel>
                 </Border>
             </StackPanel>

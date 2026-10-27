@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Security.Cryptography.X509Certificates;
 
 namespace DuoTrack.Client;
 
@@ -42,8 +43,32 @@ internal sealed class DeviceIdentity : IDisposable
         return new DeviceIdentity(identity.DeviceId, newKey);
     }
 
-    public string Sign(byte[] payload) =>
-        Convert.ToBase64String(_key.SignData(payload, HashAlgorithmName.SHA256));
+    public string Sign(byte[] payload)
+    {
+        lock (_key) return Convert.ToBase64String(_key.SignData(payload, HashAlgorithmName.SHA256));
+    }
+
+    public X509Certificate2 CreateLanCertificate()
+    {
+        lock (_key)
+        {
+            // A separate key handle keeps TLS independent of API authentication.
+            using var key = ECDsa.Create();
+            var privateBytes = _key.ExportPkcs8PrivateKey();
+            try { key.ImportPkcs8PrivateKey(privateBytes, out _); }
+            finally { CryptographicOperations.ZeroMemory(privateBytes); }
+            var request = new CertificateRequest($"CN=DuoTrack-{DeviceId:D}", key, HashAlgorithmName.SHA256);
+            request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
+            using var generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(30));
+            // Windows Schannel cannot use CreateSelfSigned's ephemeral key handle
+            // for TLS. Import a temporary user-key container (deleted on dispose).
+            var pfx = generated.Export(X509ContentType.Pfx);
+            try { return new X509Certificate2(pfx, (string?)null, X509KeyStorageFlags.UserKeySet); }
+            finally { CryptographicOperations.ZeroMemory(pfx); }
+        }
+    }
+
+    internal static DeviceIdentity CreateEphemeral() => new(Guid.NewGuid(), ECDsa.Create(ECCurve.NamedCurves.nistP256));
 
     public void Dispose() => _key.Dispose();
 

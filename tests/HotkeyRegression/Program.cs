@@ -67,3 +67,30 @@ foreach (var type in new[] { DuoTrack.Protocol.InputEventType.EnterScreen, DuoTr
         || decodedId != id || decoded != packet) throw new Exception("Screen transition wire roundtrip failed");
 }
 Console.WriteLine("PASS: all screen edges, negative coordinates, proportional entry mapping and transition packets.");
+
+foreach (var side in Enum.GetValues<DuoTrack.Protocol.ScreenSide>())
+{
+    var start = display.Position(side, 5000, inset: 5);
+    var dx = side == DuoTrack.Protocol.ScreenSide.Left ? -10 : side == DuoTrack.Protocol.ScreenSide.Right ? 10 : 0;
+    var dy = side == DuoTrack.Protocol.ScreenSide.Top ? -10 : side == DuoTrack.Protocol.ScreenSide.Bottom ? 10 : 0;
+    if (!display.TryCrossEdge(side, start.X, start.Y, dx, dy, out var fraction, out var overshoot)
+        || overshoot != 5 || Math.Abs(fraction - 5000) > 10)
+        throw new Exception($"Crossing {side} lost the entry position or remaining motion");
+    if (display.TryCrossEdge(side, start.X, start.Y, -dx, -dy, out _, out _))
+        throw new Exception("Moving away from the connection edge must not return control");
+    var source = new ScreenGeometry(0, 0, 2560, 1440);
+    var returnSide = ScreenGeometry.Opposite(side);
+    var landed = source.Position(returnSide, fraction, inset: overshoot);
+    if (source.AtEdge(returnSide, landed.X, landed.Y)) throw new Exception("Return bounced at boundary");
+    var enter = display.Position(side, 5000);
+    if (!display.TryCrossEdge(side, enter.X, enter.Y, dx, dy, out _, out _))
+        throw new Exception("Immediate reverse movement must return without a cooldown");
+}
+
+var diagonal = new ScreenGeometry(0, 0, 1920, 1080);
+if (!diagonal.TryCrossEdge(DuoTrack.Protocol.ScreenSide.Left, 10, 500, -20, 100, out var crossFraction, out var remaining)
+    || Math.Abs(crossFraction - 5097) > 10 || remaining != 10)
+    throw new Exception("Diagonal crossing must map the actual edge intersection");
+if (diagonal.TryCrossEdge(DuoTrack.Protocol.ScreenSide.Left, 10, -100, -20, 0, out _, out _))
+    throw new Exception("Moving across the extension of an edge must not switch screens");
+Console.WriteLine("PASS: continuous bidirectional crossing, immediate reversal, overshoot and diagonal edge intersection.");

@@ -61,6 +61,9 @@ try {
     if ($firstDevices.Count -ne 1 -or $secondDevices.Count -ne 1) {
         throw "Pairing did not produce one peer for each device."
     }
+    if ($firstDevices[0].publicKey -ne $second.PublicKey -or $secondDevices[0].publicKey -ne $first.PublicKey) {
+        throw "Authenticated peer list did not return the paired public keys for LAN trust."
+    }
 
     $webSocketUrl = ($BaseUrl -replace '^http', 'ws').TrimEnd('/') + '/connect'
     $firstSocket = [Net.WebSockets.ClientWebSocket]::new()

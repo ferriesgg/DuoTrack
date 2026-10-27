@@ -118,7 +118,7 @@ app.MapGet("/api/devices", async (HttpContext context) =>
 
     var devices = await repository.GetPairedDevicesAsync(deviceId);
     return Results.Ok(devices.Select(device =>
-        new DeviceResponse(device.Id, device.Name, connections.IsOnline(device.Id))));
+        new DeviceResponse(device.Id, device.Name, connections.IsOnline(device.Id), device.PublicKey)));
 });
 
 app.MapPost("/api/pairing/code", async (HttpContext context) =>
@@ -142,7 +142,7 @@ app.MapPost("/api/pairing/join", async (HttpContext context, JoinPairingRequest 
     var pairedDevice = await repository.JoinPairingAsync(deviceId, request.Code.Replace(" ", string.Empty));
     return pairedDevice is null
         ? Results.BadRequest(new { error = "invalid-or-expired-code" })
-        : Results.Ok(new DeviceResponse(pairedDevice.Id, pairedDevice.Name, connections.IsOnline(pairedDevice.Id)));
+        : Results.Ok(new DeviceResponse(pairedDevice.Id, pairedDevice.Name, connections.IsOnline(pairedDevice.Id), pairedDevice.PublicKey));
 }).RequireRateLimiting("pairing");
 
 app.Map("/connect", async context =>
@@ -231,7 +231,7 @@ record CreateSessionRequest(string DeviceId, string Challenge, string Signature)
 record SessionResponse(string Token, Guid DeviceId, string DeviceName);
 record PairingCodeResponse(string Code, DateTimeOffset ExpiresAt);
 record JoinPairingRequest(string Code);
-record DeviceResponse(Guid Id, string Name, bool Online);
+record DeviceResponse(Guid Id, string Name, bool Online, string PublicKey);
 record PendingChallenge(string Value, DateTimeOffset ExpiresAt);
 
 static class DeviceCrypto
