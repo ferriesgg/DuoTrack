@@ -119,16 +119,12 @@
                         <TextBlock Text="设置" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,10" />
                         <CheckBox x:Name="StartWithWindowsCheck" Content="开机自动启动"
                                   Checked="StartWithWindows_Changed" Unchecked="StartWithWindows_Changed" />
-                        <CheckBox x:Name="RelaySmoothingCheck" Content="公网滚动平滑（被控时生效）" Margin="0,8,0,0"
-                                  ToolTip="控制这台电脑时生效。仅中继模式使用约 8–16 毫秒的滚动缓冲，略增延迟以减少短时网络波动；按键和点击不等待。"
-                                  Checked="RelaySmoothing_Changed" Unchecked="RelaySmoothing_Changed" />
                         <TextBlock x:Name="DetailStatusText" Text="请先填写服务器地址并连接。"
                                    TextWrapping="Wrap" Foreground="#6B7280" Margin="0,12,0,0" />
                         <TextBlock Text="同一局域网自动优先直连。首次出现防火墙提示时，请允许 DuoTrack 通过专用网络。"
                                    TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
                         <TextBlock x:Name="GestureStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
                         <TextBlock x:Name="PerformanceStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
-                        <TextBlock x:Name="RelayNetworkText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,8,0,0" />
                     </StackPanel>
                 </Border>
             </StackPanel>

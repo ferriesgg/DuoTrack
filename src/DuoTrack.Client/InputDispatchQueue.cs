@@ -4,22 +4,18 @@ using DuoTrack.Protocol;
 
 namespace DuoTrack.Client;
 
-internal sealed class InputDispatchQueue(Dispatcher dispatcher, Action<RoutedInput> deliver) : IDisposable
+internal sealed class InputDispatchQueue(Dispatcher dispatcher, Action<Guid, InputPacket> deliver) : IDisposable
 {
-    public InputDispatchQueue(Dispatcher dispatcher, Action<Guid, InputPacket> deliver)
-        : this(dispatcher, item => deliver(item.Peer, item.Packet)) { }
     private readonly InputPacketQueue _queue = new();
     private int _scheduled;
     private volatile bool _disposed;
     private readonly InputPerformance _performance = new();
     public InputPerformanceSnapshot Performance => _performance.Snapshot();
 
-    public void Enqueue(Guid source, InputPacket packet) => Enqueue(source, packet, null);
-
-    public void Enqueue(Guid source, InputPacket packet, bool? direct)
+    public void Enqueue(Guid source, InputPacket packet)
     {
         if (_disposed) return;
-        _performance.ObserveQueue(_queue.Enqueue(new RoutedInput(source, packet, Stopwatch.GetTimestamp(), direct)));
+        _performance.ObserveQueue(_queue.Enqueue(new RoutedInput(source, packet, Stopwatch.GetTimestamp())));
         Schedule();
     }
 
@@ -38,7 +34,7 @@ internal sealed class InputDispatchQueue(Dispatcher dispatcher, Action<RoutedInp
             {
                 if (!_queue.TryDequeue(out var item)) break;
                 _performance.ObserveDelivery(item.QueuedAt);
-                deliver(item);
+                deliver(item.Peer, item.Packet);
             }
         }
         finally

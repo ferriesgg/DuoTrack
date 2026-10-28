@@ -28,12 +28,6 @@ internal sealed class BridgeConnection : IDisposable
     public InputPerformanceSnapshot Performance => _performance.Snapshot();
     private volatile bool _relayConnected;
     private volatile bool _connected;
-    private readonly SemaphoreSlim _relaySendLock = new(1, 1);
-    private long _relayRttTicks;
-    private long _relayPeakRttTicks;
-    public double RelayRttMs => Interlocked.Read(ref _relayRttTicks) * 1000.0 / Stopwatch.Frequency;
-    public double RelayPeakRttMs => Interlocked.Read(ref _relayPeakRttTicks) * 1000.0 / Stopwatch.Frequency;
-    public bool IsDirectSession(Guid peer) => _sessionRoutes.TryGetValue(peer, out var direct) && direct;
 
     public bool IsConnected => _connected;
     public bool IsRelayConnected => _relayConnected;
@@ -42,7 +36,6 @@ internal sealed class BridgeConnection : IDisposable
     public event Action? DevicesChanged;
     public event Action<Guid>? PeerConnectionLost;
     public event Action<Guid, InputPacket>? PacketReceived;
-    public event Action<Guid, InputPacket, bool>? InputReceived;
 
     public BridgeConnection(BridgeApiClient api, string deviceName, DeviceIdentity identity, LanPeerTransport? lan = null)
     {
@@ -113,7 +106,6 @@ internal sealed class BridgeConnection : IDisposable
         }
         else if (_sessionRoutes.TryGetValue(source, out var currentRoute) && currentRoute != direct) return;
         PacketReceived?.Invoke(source, packet);
-        InputReceived?.Invoke(source, packet, direct);
         if (packet.Type == InputEventType.ReleaseAll) _sessionRoutes.TryRemove(source, out _);
     }
 
@@ -127,7 +119,7 @@ internal sealed class BridgeConnection : IDisposable
             {
                 for (var batch = 0; batch < 256 && _outgoing.TryDequeue(out var item); batch++)
                 {
-                    var (target, packet, _, _) = item;
+                    var (target, packet, _) = item;
                     if (packet.Type == InputEventType.EnterScreen)
                     {
                         _sessionRoutes[target] = _lan.IsConnected(target);
@@ -138,9 +130,7 @@ internal sealed class BridgeConnection : IDisposable
                     var count = 1;
                     batchItems[0] = item;
                     batchPackets[0] = packet;
-                    var relaySocket = Volatile.Read(ref _relaySocket);
-                    var relayBatch = relaySocket?.SubProtocol == RelayWire.BatchSubProtocol;
-                    if ((direct || relayBatch) && packet.Type != InputEventType.ReleaseAll)
+                    if (direct && packet.Type != InputEventType.ReleaseAll)
                     {
                         while (count < batchItems.Length && _outgoing.TryDequeueFollowing(target, out var next))
                         {
@@ -152,14 +142,13 @@ internal sealed class BridgeConnection : IDisposable
                     for (var i = 0; i < count; i++) _performance.ObserveDelivery(batchItems[i].QueuedAt);
                     var sent = false;
                     if (direct) sent = await _lan.SendBatchAsync(target, batchPackets.AsMemory(0, count), token);
-                    else if (relaySocket is { State: WebSocketState.Open } socket)
+                    else if (_relaySocket is { State: WebSocketState.Open } socket)
                     {
                         try
                         {
-                            var payload = relayBatch && count > 1
-                                ? RelayWire.EncodeBatch(target, batchPackets.AsSpan(0, count))
-                                : RelayWire.EncodeInput(target, packet);
-                            await SendRelayAsync(socket, payload, token);
+                            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                            timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                            await socket.SendAsync(RelayWire.EncodeInput(target, packet), WebSocketMessageType.Binary, true, timeout.Token);
                             sent = true;
                         }
                         catch (Exception ex) when (ex is WebSocketException or OperationCanceledException or ObjectDisposedException) { }
@@ -193,7 +182,6 @@ internal sealed class BridgeConnection : IDisposable
                 _serverDevices = (await _api.GetDevicesAsync(token)).ToArray();
                 using var socket = new ClientWebSocket();
                 socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
-                socket.Options.AddSubProtocol(RelayWire.BatchSubProtocol);
                 socket.Options.SetRequestHeader("Authorization", $"Bearer {_api.SessionToken}");
                 await socket.ConnectAsync(_api.BuildWebSocketUri(), token);
                 _relaySocket = socket;
@@ -204,10 +192,9 @@ internal sealed class BridgeConnection : IDisposable
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(token);
                 var receive = ReceiveRelayAsync(socket, linked.Token);
                 var refresh = RefreshPeersAsync(linked.Token);
-                var ping = PingRelayAsync(socket, linked.Token);
-                await Task.WhenAny(receive, refresh, ping);
+                await Task.WhenAny(receive, refresh);
                 linked.Cancel();
-                try { await Task.WhenAll(receive, refresh, ping); } catch (OperationCanceledException) { }
+                try { await Task.WhenAll(receive, refresh); } catch (OperationCanceledException) { }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
             catch (Exception ex)
@@ -219,8 +206,6 @@ internal sealed class BridgeConnection : IDisposable
             {
                 _relaySocket = null;
                 _relayConnected = false;
-                Interlocked.Exchange(ref _relayRttTicks, 0);
-                Interlocked.Exchange(ref _relayPeakRttTicks, 0);
                 foreach (var route in _sessionRoutes.Where(p => !p.Value).ToArray()) InterruptSession(route.Key);
                 UpdateConnectivity();
                 DevicesChanged?.Invoke();
@@ -252,48 +237,9 @@ internal sealed class BridgeConnection : IDisposable
         {
             var result = await socket.ReceiveAsync(buffer, token);
             if (result.MessageType == WebSocketMessageType.Close) return;
-            if (result.MessageType != WebSocketMessageType.Binary || !result.EndOfMessage) continue;
-            if (RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var source, out var packet)) OnPacket(source, packet, direct: false);
-            else if (socket.SubProtocol == RelayWire.BatchSubProtocol)
-            {
-                if (RelayWire.TryDecodeBatch(buffer.AsSpan(0, result.Count), out source, out var packets))
-                    foreach (var input in packets) OnPacket(source, input, direct: false);
-                else if (RelayWire.TryDecodePing(buffer.AsSpan(0, result.Count), out var started) && started > 0 && started <= Stopwatch.GetTimestamp())
-                {
-                    var elapsed = Stopwatch.GetTimestamp() - started;
-                    Interlocked.Exchange(ref _relayRttTicks, elapsed);
-                    var peak = Interlocked.Read(ref _relayPeakRttTicks);
-                    while (elapsed > peak)
-                    {
-                        var previous = Interlocked.CompareExchange(ref _relayPeakRttTicks, elapsed, peak);
-                        if (previous == peak) break;
-                        peak = previous;
-                    }
-                }
-            }
-        }
-    }
-
-    private async Task SendRelayAsync(ClientWebSocket socket, ReadOnlyMemory<byte> payload, CancellationToken token)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(3));
-        await _relaySendLock.WaitAsync(timeout.Token);
-        try { await socket.SendAsync(payload, WebSocketMessageType.Binary, true, timeout.Token); }
-        finally { _relaySendLock.Release(); }
-    }
-
-    private async Task PingRelayAsync(ClientWebSocket socket, CancellationToken token)
-    {
-        if (socket.SubProtocol != RelayWire.BatchSubProtocol)
-        {
-            await Task.Delay(Timeout.Infinite, token);
-            return;
-        }
-        while (!token.IsCancellationRequested)
-        {
-            await SendRelayAsync(socket, RelayWire.EncodePing(Stopwatch.GetTimestamp()), token);
-            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            if (result.MessageType == WebSocketMessageType.Binary && result.EndOfMessage &&
+                RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var source, out var packet))
+                OnPacket(source, packet, direct: false);
         }
     }
 

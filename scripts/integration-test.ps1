@@ -70,7 +70,6 @@ try {
     $secondSocket = [Net.WebSockets.ClientWebSocket]::new()
     try {
         $firstSocket.Options.SetRequestHeader("Authorization", "Bearer $($first.Token)")
-        $firstSocket.Options.AddSubProtocol("duotrack.v2")
         $secondSocket.Options.SetRequestHeader("Authorization", "Bearer $($second.Token)")
         $firstSocket.ConnectAsync([Uri]$webSocketUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
         $secondSocket.ConnectAsync([Uri]$webSocketUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
@@ -120,77 +119,6 @@ try {
             finally { $timeout.Dispose() }
         }
 
-        if ($firstSocket.SubProtocol -ne "duotrack.v2") { throw "Updated relay did not negotiate batch support." }
-        # Modern sender -> legacy receiver must retain individual v1 frames.
-        [byte[]]$batch = [byte[]]::new(19 + 3 * 13)
-        $batch[0] = 2
-        $second.Id.ToByteArray().CopyTo($batch, 1)
-        [BitConverter]::GetBytes([uint16]3).CopyTo($batch, 17)
-        for ($i = 0; $i -lt 3; $i++) {
-            $batch[19 + $i * 13] = 4
-            [BitConverter]::GetBytes([int](10 + $i)).CopyTo($batch, 20 + $i * 13)
-        }
-        $firstSocket.SendAsync([ArraySegment[byte]]::new($batch), [Net.WebSockets.WebSocketMessageType]::Binary, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-        for ($i = 0; $i -lt 3; $i++) {
-            [byte[]]$received = [byte[]]::new(128)
-            $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(5))
-            try {
-                $result = $secondSocket.ReceiveAsync([ArraySegment[byte]]::new($received), $timeout.Token).GetAwaiter().GetResult()
-                if ($result.Count -ne 30 -or [Guid]::new([byte[]]$received[1..16]) -ne $first.Id -or
-                    $received[17] -ne 4 -or [BitConverter]::ToInt32($received, 18) -ne 10 + $i) {
-                    throw "Batch-to-legacy relay changed sender identity or input ordering."
-                }
-            }
-            finally { $timeout.Dispose() }
-        }
-
-        [byte[]]$ping = [byte[]]::new(9)
-        $ping[0] = 3
-        [BitConverter]::GetBytes([long]123456789).CopyTo($ping, 1)
-        $firstSocket.SendAsync([ArraySegment[byte]]::new($ping), [Net.WebSockets.WebSocketMessageType]::Binary, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-        [byte[]]$received = [byte[]]::new(128)
-        $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(5))
-        try {
-            $result = $firstSocket.ReceiveAsync([ArraySegment[byte]]::new($received), $timeout.Token).GetAwaiter().GetResult()
-            if ($result.Count -ne 9 -or $received[0] -ne 3 -or [BitConverter]::ToInt64($received, 1) -ne 123456789) { throw "RTT echo failed." }
-        }
-        finally { $timeout.Dispose() }
-
-        $unpaired = New-TestDevice "Unpaired relay probe"
-        $unpairedSocket = [Net.WebSockets.ClientWebSocket]::new()
-        try {
-            Register-Device $unpaired
-            Connect-Device $unpaired
-            $unpairedSocket.Options.SetRequestHeader("Authorization", "Bearer $($unpaired.Token)")
-            $unpairedSocket.Options.AddSubProtocol("duotrack.v2")
-            $unpairedSocket.ConnectAsync([Uri]$webSocketUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-            $unpaired.Id.ToByteArray().CopyTo($batch, 1)
-            $firstSocket.SendAsync([ArraySegment[byte]]::new($batch), [Net.WebSockets.WebSocketMessageType]::Binary, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-            $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(1))
-            $delivered = $false
-            try {
-                $result = $unpairedSocket.ReceiveAsync([ArraySegment[byte]]::new($received), $timeout.Token).GetAwaiter().GetResult()
-                $delivered = $result.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Binary
-            }
-            catch { if (-not $timeout.IsCancellationRequested) { throw } }
-            finally { $timeout.Dispose() }
-            if ($delivered) { throw "Unpaired device received batched input." }
-        }
-        finally { $unpairedSocket.Dispose(); $unpaired.Key.Dispose() }
-
-        $firstSocket.Abort()
-        [byte[]]$received = [byte[]]::new(128)
-        $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(5))
-        try {
-            $result = $secondSocket.ReceiveAsync([ArraySegment[byte]]::new($received), $timeout.Token).GetAwaiter().GetResult()
-            if ($result.Count -ne 30 -or $received[17] -ne 5 -or [BitConverter]::ToUInt32($received, 26) -ne 1) {
-                throw "Disconnect did not send a distinct release marker for discarding pending playback."
-            }
-        }
-        finally { $timeout.Dispose() }
-
-        Write-Host "PASS: negotiated batches, modern-to-legacy ordering, RTT echo and unpaired-recipient rejection"
-        Write-Host "PASS: peer disconnect sends release marker to cancel pending scroll playback"
         Write-Host "PASS: registration, signed authentication, pairing, device listing, sender identity, screen entry and return control"
     }
     finally {
