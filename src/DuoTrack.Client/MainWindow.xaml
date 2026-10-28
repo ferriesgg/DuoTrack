@@ -125,6 +125,11 @@
                                    TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
                         <TextBlock x:Name="GestureStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
                         <TextBlock x:Name="PerformanceStatusText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" />
+                        <Button Content="导出滚动诊断" Click="ExportScrollDiagnostics_Click" Margin="0,10,0,0"
+                                ToolTip="出现跳动后返回主电脑，在两台电脑分别导出。记录滚动增量和处理耗时，不记录输入文字。" />
+                        <CheckBox x:Name="IsolateInjectionCheck" Content="诊断：独立线程注入（重启生效）" Margin="0,12,0,0"
+                                  Checked="IsolateInjection_Changed" Unchecked="IsolateInjection_Changed" />
+                        <TextBlock x:Name="InjectionModeText" TextWrapping="Wrap" Foreground="#6B7280" FontSize="12" Margin="0,5,0,0" />
                     </StackPanel>
                 </Border>
             </StackPanel>

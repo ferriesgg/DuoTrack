@@ -2,8 +2,8 @@ using System.Windows.Threading;
 
 namespace DuoTrack.Client;
 
-// Owns hooks, native touchpad window and input injection. WPF layout/rendering
-// never needs to run before this thread can capture or deliver an input event.
+// Owns an STA message loop independently of WPF layout/rendering. Diagnostic
+// isolation uses separate instances for capture/hooks and received input.
 internal sealed class InputProcessingThread : IDisposable
 {
     private readonly Thread _thread;

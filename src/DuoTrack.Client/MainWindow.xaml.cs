@@ -9,12 +9,13 @@ namespace DuoTrack.Client;
 
 public partial class MainWindow : Window
 {
-    private readonly ClientSettings _settings = ClientSettings.Load();
+    private readonly ClientSettings _settings;
     private readonly DeviceIdentity _identity = DeviceIdentity.LoadOrCreate();
     private readonly BridgeApiClient _api;
     private readonly WindowsInputInjector _injector = new();
     private readonly InputHookManager _hooks;
     private readonly InputProcessingThread _inputThread;
+    private readonly InputProcessingThread _hookThread;
     private readonly RemoteInputWindow _remoteInput;
     private InputDispatchQueue? _inputDispatch;
     private readonly ObservableCollection<DeviceInfo> _devices = [];
@@ -30,19 +31,29 @@ public partial class MainWindow : Window
     private ScreenGeometry _incomingScreen;
     private bool _incomingCanReturn;
 
-    public MainWindow()
+    public MainWindow() : this(ClientSettings.Load()) { }
+
+    internal MainWindow(ClientSettings settings)
     {
+        _settings = settings;
         InitializeComponent();
         _api = new BridgeApiClient(_identity);
         _inputThread = new InputProcessingThread();
-        _hooks = _inputThread.Invoke(() => new InputHookManager());
-        _remoteInput = _inputThread.Invoke(() => new RemoteInputWindow());
+        _hookThread = _settings.IsolateInputInjection ? new InputProcessingThread() : _inputThread;
+        ScrollDiagnostics.InjectionMode = _settings.IsolateInputInjection ? "isolated" : "shared";
+        _hooks = _hookThread.Invoke(() => new InputHookManager());
+        _remoteInput = _hookThread.Invoke(() => new RemoteInputWindow());
         _remoteInput.PacketCaptured += packet => _connection?.Send(packet);
         _remoteInput.CaptureError += message => Dispatcher.BeginInvoke(() => DetailStatusText.Text = message);
+        _remoteInput.GestureStatusChanged += message => Dispatcher.BeginInvoke(() => GestureStatusText.Text = message);
         GestureStatusText.Text = _remoteInput.GestureStatus;
         if (!Enum.IsDefined(_settings.RemoteScreenSide)) _settings.RemoteScreenSide = ScreenSide.Right;
-        _hooks.PacketCaptured += packet => _connection?.Send(packet);
-        _hooks.ForwardingChanged += forwarding => _inputThread.Dispatcher.BeginInvoke(() =>
+        _hooks.PacketCaptured += packet =>
+        {
+            _connection?.Send(packet);
+            _remoteInput.NotifyLocalInput();
+        };
+        _hooks.ForwardingChanged += forwarding => _hookThread.Dispatcher.BeginInvoke(() =>
         {
             if (_isExiting || _hooks.IsForwarding != forwarding) return;
             try
@@ -62,6 +73,8 @@ public partial class MainWindow : Window
         ServerUrlBox.Text = _settings.ServerUrl;
         DeviceNameBox.Text = _settings.DeviceName;
         StartWithWindowsCheck.IsChecked = _settings.StartWithWindows;
+        IsolateInjectionCheck.IsChecked = _settings.IsolateInputInjection;
+        InjectionModeText.Text = _settings.IsolateInputInjection ? "当前模式：独立线程注入" : "当前模式：共用输入线程";
         EdgeSwitchCheck.IsChecked = _settings.EdgeSwitchEnabled;
         _hooks.EdgeSwitchEnabled = _settings.EdgeSwitchEnabled;
         _hooks.RemoteScreenSide = _settings.RemoteScreenSide;
@@ -426,6 +439,34 @@ public partial class MainWindow : Window
         _injector.ReleaseAll();
     }
 
+    private void ExportScrollDiagnostics_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "导出滚动诊断", Filter = "滚动诊断 (*.json)|*.json",
+            FileName = $"DuoTrack-scroll-{DateTime.Now:yyyyMMdd-HHmmss}.json"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            System.IO.File.WriteAllText(dialog.FileName, ScrollDiagnostics.ExportJson());
+            DetailStatusText.Text = $"滚动诊断已保存：{dialog.FileName}";
+        }
+        catch (Exception ex) { ShowError($"导出失败：{ex.Message}"); }
+    }
+
+    private void IsolateInjection_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initializing) return;
+        try
+        {
+            _settings.IsolateInputInjection = IsolateInjectionCheck.IsChecked == true;
+            _settings.Save();
+            InjectionModeText.Text = $"当前模式：{(ScrollDiagnostics.InjectionMode == "isolated" ? "独立线程注入" : "共用输入线程")}。设置已保存，从托盘退出并重新打开后生效。";
+        }
+        catch (Exception ex) { ShowError(ex.Message); }
+    }
+
     private void StartWithWindows_Changed(object sender, RoutedEventArgs e)
     {
         if (_initializing) return;
@@ -484,21 +525,45 @@ public partial class MainWindow : Window
         _refreshTimer.Stop();
         _inputDispatch?.Dispose();
         _connection?.Dispose();
-        _ = _inputThread.StopAsync(() =>
-        {
-            try { _hooks.Dispose(); }
-            finally
-            {
-                try { _remoteInput.Dispose(); }
-                finally { _injector.ReleaseAll(); }
-            }
-        });
+        _ = StopInputThreadsAsync();
         _api.Dispose();
         _identity.Dispose();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         base.OnClosing(e);
         System.Windows.Application.Current.Shutdown();
+    }
+
+    private async Task StopInputThreadsAsync()
+    {
+        if (ReferenceEquals(_inputThread, _hookThread))
+        {
+            await _inputThread.StopAsync(() =>
+            {
+                try { _hooks.Dispose(); }
+                finally
+                {
+                    try { _remoteInput.Dispose(); }
+                    finally { _injector.ReleaseAll(); }
+                }
+            }).ConfigureAwait(false);
+            return;
+        }
+        try
+        {
+            // Keep the hook message loop alive while SendInput releases held keys.
+            // Neither hook callbacks nor the hook thread wait for injection.
+            await _inputThread.StopAsync(_injector.ReleaseAll).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!ReferenceEquals(_inputThread, _hookThread))
+                await _hookThread.StopAsync(() =>
+                {
+                    try { _hooks.Dispose(); }
+                    finally { _remoteInput.Dispose(); }
+                }).ConfigureAwait(false);
+        }
     }
 
     private void EnsureConnected()

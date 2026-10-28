@@ -21,13 +21,18 @@ internal static class Program
             view.Measure(new Size(864, 791));
             view.Arrange(new Rect(0, 0, 864, 791));
             view.UpdateLayout();
-            foreach (var name in new[] { "LayoutLeft", "LayoutRight", "LayoutTop", "LayoutBottom", "EdgeSwitchCheck" })
+            foreach (var name in new[] { "LayoutLeft", "LayoutRight", "LayoutTop", "LayoutBottom", "EdgeSwitchCheck", "IsolateInjectionCheck", "InjectionModeText" })
             {
                 if (window.FindName(name) is not FrameworkElement control || control.ActualHeight < 12)
                     throw new Exception($"Missing or collapsed layout control: {name}");
             }
             if (((Button)window.FindName("ControlButton")).IsEnabled)
                 throw new Exception("Control should be disabled without an online target");
+            if (args.Contains("--settings"))
+            {
+                ((FrameworkElement)window.FindName("InjectionModeText")).BringIntoView();
+                view.UpdateLayout();
+            }
             var bitmap = new RenderTargetBitmap(864, 791, 96, 96, PixelFormats.Pbgra32);
             var drawing = new DrawingVisual();
             using (var context = drawing.RenderOpen())

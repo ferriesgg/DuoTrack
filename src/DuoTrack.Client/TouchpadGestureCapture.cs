@@ -44,6 +44,8 @@ internal sealed class TouchpadGestureCapture : IDisposable
         private readonly TouchpadGesturesController _controller;
         private readonly PhysicalGestureRecognizer _recognizer;
         private readonly Action<SwipeDirection> _gesture;
+        private bool _enabled;
+        private readonly HashSet<uint> _contacts = [];
 
         public NativeCapture(Action<SwipeDirection> gesture)
         {
@@ -64,21 +66,44 @@ internal sealed class TouchpadGestureCapture : IDisposable
 
         public void SetEnabled(bool enabled)
         {
-            _controller.Enabled = enabled;
-            if (!enabled) _recognizer.CompleteGesture();
+            _enabled = false;
+            try
+            {
+                _controller.Enabled = enabled;
+                _enabled = enabled;
+            }
+            finally
+            {
+                if (!enabled)
+                {
+                    _contacts.Clear();
+                    _recognizer.CompleteGesture();
+                }
+            }
         }
 
-        private void Pressed(TouchpadGesturesController sender, PointerEventArgs args) => _recognizer.ProcessDownEvent(args.CurrentPoint);
-        private void Moved(TouchpadGesturesController sender, PointerEventArgs args) => _recognizer.ProcessMoveEvents(args.GetIntermediatePoints());
-        private void Released(TouchpadGesturesController sender, PointerEventArgs args) => _recognizer.ProcessUpEvent(args.CurrentPoint);
+        private void Pressed(TouchpadGesturesController sender, PointerEventArgs args)
+        {
+            if (_enabled && _contacts.Add(args.CurrentPoint.PointerId)) _recognizer.ProcessDownEvent(args.CurrentPoint);
+        }
+        private void Moved(TouchpadGesturesController sender, PointerEventArgs args)
+        {
+            if (_enabled && _contacts.Contains(args.CurrentPoint.PointerId)) _recognizer.ProcessMoveEvents(args.GetIntermediatePoints());
+        }
+        private void Released(TouchpadGesturesController sender, PointerEventArgs args)
+        {
+            if (_enabled && _contacts.Remove(args.CurrentPoint.PointerId)) _recognizer.ProcessUpEvent(args.CurrentPoint);
+        }
         private void Completed(PhysicalGestureRecognizer sender, ManipulationCompletedEventArgs args)
         {
-            if (_controller.Enabled && GestureShortcut.Direction(args.Cumulative.Translation.X, args.Cumulative.Translation.Y) is { } direction)
+            if (_enabled && GestureShortcut.Direction(args.Cumulative.Translation.X, args.Cumulative.Translation.Y) is { } direction)
                 _gesture(direction);
         }
 
         public void Dispose()
         {
+            _enabled = false;
+            _contacts.Clear();
             _controller.Enabled = false;
             _controller.PointerPressed -= Pressed;
             _controller.PointerMoved -= Moved;

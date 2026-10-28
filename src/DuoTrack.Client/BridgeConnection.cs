@@ -93,12 +93,14 @@ internal sealed class BridgeConnection : IDisposable
     public void SendTo(Guid target, InputPacket packet)
     {
         if (_shutdown.IsCancellationRequested) return;
+        packet = WheelCapture.Stamp(packet);
         _performance.ObserveQueue(_outgoing.Enqueue(new RoutedInput(target, packet, Stopwatch.GetTimestamp())));
         _outgoingWake.Writer.TryWrite(0);
     }
 
     private void OnPacket(Guid source, InputPacket packet, bool direct)
     {
+        ScrollDiagnostics.Observe(direct ? ScrollStage.ReceiveLan : ScrollStage.ReceiveRelay, packet);
         if (packet.Type == InputEventType.EnterScreen)
         {
             _sessionRoutes[source] = direct;
@@ -140,6 +142,7 @@ internal sealed class BridgeConnection : IDisposable
                         }
                     }
                     for (var i = 0; i < count; i++) _performance.ObserveDelivery(batchItems[i].QueuedAt);
+                    for (var i = 0; i < count; i++) ScrollDiagnostics.Observe(ScrollStage.Send, batchPackets[i]);
                     var sent = false;
                     if (direct) sent = await _lan.SendBatchAsync(target, batchPackets.AsMemory(0, count), token);
                     else if (_relaySocket is { State: WebSocketState.Open } socket)

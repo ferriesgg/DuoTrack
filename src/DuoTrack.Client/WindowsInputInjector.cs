@@ -23,9 +23,12 @@ internal sealed class WindowsInputInjector
                 InjectButton((MouseButton)packet.Value1, packet.Value2 != 0);
                 break;
             case InputEventType.MouseWheel:
+                ScrollDiagnostics.Observe(ScrollStage.InjectStart, packet);
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
                 InjectMouse(0, 0, unchecked((uint)packet.Value1), packet.Value2 != 0
                     ? NativeMethods.MouseeventfHWheel
                     : NativeMethods.MouseeventfWheel);
+                ScrollDiagnostics.Observe(ScrollStage.InjectComplete, packet, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 break;
             case InputEventType.ReleaseAll:
                 ReleaseAll();

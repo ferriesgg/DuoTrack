@@ -192,6 +192,22 @@ internal sealed class InputHookManager : IDisposable
         }
 
         var data = Marshal.PtrToStructure<NativeMethods.MsLlHookStruct>(lParam);
+        if (data.ExtraInfo == NativeMethods.DuoTrackInputTag &&
+            (int)wParam is NativeMethods.WmMouseWheel or NativeMethods.WmMouseHWheel)
+        {
+            // Observe only our injected wheel path. Native ExtraInfo contains a
+            // fixed marker, not the source frame; do not invent a correlation ID.
+            var wheel = new InputPacket(InputEventType.MouseWheel,
+                unchecked((short)(data.MouseData >> 16)), (int)wParam == NativeMethods.WmMouseHWheel ? 1 : 0);
+            ScrollDiagnostics.Observe(ScrollStage.InjectedHookEnter, wheel);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam); }
+            finally
+            {
+                ScrollDiagnostics.Observe(ScrollStage.InjectedHookNextReturned, wheel,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - started);
+            }
+        }
         if (data.ExtraInfo == NativeMethods.DuoTrackInputTag ||
             (IsReceiving && (data.Flags & NativeMethods.LlmhfInjected) != 0))
         {
@@ -262,7 +278,9 @@ internal sealed class InputHookManager : IDisposable
             case NativeMethods.WmMouseWheel:
             case NativeMethods.WmMouseHWheel:
                 var delta = unchecked((short)(data.MouseData >> 16));
-                PacketCaptured?.Invoke(new InputPacket(InputEventType.MouseWheel, delta, message == NativeMethods.WmMouseHWheel ? 1 : 0));
+                var wheel = WheelCapture.StampNative(new InputPacket(InputEventType.MouseWheel, delta, message == NativeMethods.WmMouseHWheel ? 1 : 0), data.Time);
+                ScrollDiagnostics.Observe(ScrollStage.CaptureHook, wheel);
+                PacketCaptured?.Invoke(wheel);
                 break;
         }
 

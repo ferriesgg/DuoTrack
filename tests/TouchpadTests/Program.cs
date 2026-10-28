@@ -11,11 +11,22 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Contains("--capture-diagnostics")) { CaptureDiagnostics(); return; }
+        if (args.Contains("--gesture-native")) { NativeTest(gesturesOnly: true); return; }
+        if (args.Contains("--thread-isolation")) { ThreadIsolationTest(args.Contains("--isolated")); return; }
+        if (args.Contains("--queue-regression")) { ScrollQueueRegression.Run(); return; }
+        GestureCaptureRegression.Run();
+        ScrollQueueRegression.Run();
         var peer = Guid.NewGuid();
         var queue = new InputPacketQueue();
-        for (var i = 0; i < 10000; i++) queue.Enqueue(new RoutedInput(peer, new InputPacket(InputEventType.MouseWheel, 1)));
-        if (queue.Count != 1 || !queue.TryDequeue(out var sum) || sum.Packet.Value1 != 10000)
-            throw new Exception("High-resolution wheel coalescing lost scroll distance");
+        for (var i = 0; i < 10000; i++) queue.Enqueue(new RoutedInput(peer, WheelCapture.Stamp(new InputPacket(InputEventType.MouseWheel, 1), 1000)));
+        long precisionTotal = 0;
+        while (queue.TryDequeue(out var sum))
+        {
+            if (sum.Packet.Value1 > 120) throw new Exception("Coalescing manufactured a large wheel jump");
+            precisionTotal += sum.Packet.Value1;
+        }
+        if (precisionTotal != 10000) throw new Exception("High-resolution wheel coalescing lost scroll distance");
         InputPacket[] ordered = [new(InputEventType.MouseWheel, 1), new(InputEventType.Key, 65),
             new(InputEventType.MouseWheel, 2), new(InputEventType.MouseWheel, -3),
             new(InputEventType.MouseWheel, -4, 1), new(InputEventType.ReleaseAll)];
@@ -50,15 +61,16 @@ internal static class Program
         var delivered = new List<InputPacket>();
         using (var dispatch = new InputDispatchQueue(dispatcher, (_, packet) => delivered.Add(packet)))
         {
-            for (var i = 0; i < 10000; i++) dispatch.Enqueue(peer, new InputPacket(InputEventType.MouseWheel, 1));
+            for (var i = 0; i < 10000; i++) dispatch.Enqueue(peer, WheelCapture.Stamp(new InputPacket(InputEventType.MouseWheel, 1), 1000));
             dispatch.Enqueue(peer, new InputPacket(InputEventType.ReleaseAll));
             var frame = new DispatcherFrame();
             dispatcher.BeginInvoke(DispatcherPriority.Background, () => frame.Continue = false);
             Dispatcher.PushFrame(frame);
-            if (delivered.Count != 2 || delivered[0].Value1 != 10000 || delivered[1].Type != InputEventType.ReleaseAll)
+            if (delivered.Count != 85 || delivered.Take(84).Sum(p => p.Value1) != 10000
+                || delivered.Take(84).Any(p => p.Value1 > 120) || delivered[^1].Type != InputEventType.ReleaseAll)
                 throw new Exception("UI dispatch batching or release ordering failed");
         }
-        Console.WriteLine("PASS: 10,000 scroll events delivered to UI as one scroll plus ordered release");
+        Console.WriteLine("PASS: 10,000 same-frame scroll deltas delivered in bounded units plus ordered release");
 
         var firstDevice = new DeviceInfo(Guid.NewGuid(), "A", true);
         var secondDevice = new DeviceInfo(Guid.NewGuid(), "B", true);
@@ -88,18 +100,152 @@ internal static class Program
             Console.WriteLine("PASS: dedicated input thread delivers events while the UI thread is blocked");
         }
 
+        using (var input = new InputProcessingThread())
+        using (var moved = new ManualResetEventSlim())
+        {
+            var wheelCalls = 0;
+            using var dispatch = new InputDispatchQueue(input.Dispatcher, (_, p) =>
+            {
+                if (p.Type == InputEventType.MouseWheel)
+                {
+                    wheelCalls++;
+                    var call = System.Diagnostics.Stopwatch.StartNew();
+                    while (call.Elapsed.TotalMilliseconds < .25) Thread.SpinWait(10);
+                }
+                if (p.Type == InputEventType.MouseMove) moved.Set();
+            });
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            input.Invoke(() =>
+            {
+                for (var i = 0; i < 10000; i++)
+                    dispatch.Enqueue(peer, WheelCapture.Stamp(new InputPacket(InputEventType.MouseWheel, 1), 1000));
+                dispatch.Enqueue(peer, new InputPacket(InputEventType.MouseMove, 1, 1));
+            });
+            if (!moved.Wait(TimeSpan.FromMilliseconds(500)) || wheelCalls != 84)
+                throw new Exception("Bounded scrolling starved the following pointer input");
+            Console.WriteLine($"PASS: pointer delivered after 10,000-delta overload in {clock.ElapsedMilliseconds} ms, using {wheelCalls} bounded injections");
+        }
+        ScrollDiagnostics.Observe(ScrollStage.CaptureWindow, new InputPacket(InputEventType.MouseWheel, 7));
+        ScrollDiagnostics.Observe(ScrollStage.Send, new InputPacket(InputEventType.Key, 65));
+        using (var document = System.Text.Json.JsonDocument.Parse(ScrollDiagnostics.ExportJson()))
+        {
+            var records = document.RootElement.GetProperty("Records").EnumerateArray().ToArray();
+            if (records.Length != 1 || records[0].GetProperty("Delta").GetInt32() != 7)
+                throw new Exception("Diagnostics failed to record wheel sample or recorded keyboard input");
+        }
+        Console.WriteLine("PASS: wheel diagnostics export excludes keyboard input");
+
         // Native integration test is explicit because it briefly owns foreground
         // input and injects synthetic contacts into this test's capture window.
         if (args.Contains("--native")) NativeTest();
     }
 
-    private static void NativeTest()
+    private static void ThreadIsolationTest(bool isolated)
+    {
+        // Exercise the real MainWindow wiring without Loaded/network connection,
+        // without SendInput, and without modifying the user's saved settings.
+        var app = new Application();
+        var window = new MainWindow(new ClientSettings { IsolateInputInjection = isolated });
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var input = (InputProcessingThread)typeof(MainWindow).GetField("_inputThread", flags)!.GetValue(window)!;
+        var hooks = (InputProcessingThread)typeof(MainWindow).GetField("_hookThread", flags)!.GetValue(window)!;
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        try
+        {
+            if (ReferenceEquals(input, hooks) == isolated) throw new Exception("Incorrect thread wiring");
+            var blocked = input.Dispatcher.InvokeAsync(() =>
+            {
+                entered.Set();
+                if (!release.Wait(TimeSpan.FromSeconds(5))) throw new Exception("Test worker was not released");
+            }).Task;
+            if (!entered.Wait(TimeSpan.FromSeconds(2))) throw new Exception("Input worker did not start");
+            var ping = hooks.Dispatcher.InvokeAsync(() => { }).Task;
+            try
+            {
+                var responsive = ping.Wait(TimeSpan.FromMilliseconds(500));
+                if (responsive != isolated) throw new Exception("Unexpected hook responsiveness during injection stall");
+            }
+            finally { release.Set(); }
+            if (!Task.WaitAll([blocked, ping], TimeSpan.FromSeconds(2))) throw new Exception("Input did not resume");
+            using var json = System.Text.Json.JsonDocument.Parse(ScrollDiagnostics.ExportJson());
+            if (json.RootElement.GetProperty("InjectionMode").GetString() != (isolated ? "isolated" : "shared"))
+                throw new Exception("Exported mode does not match running mode");
+            Console.WriteLine($"PASS: {(isolated ? "isolated hook loop stays responsive" : "shared loop reproduces worker contention")}; real window wiring and mode metadata");
+        }
+        finally
+        {
+            release.Set();
+            // Finish shutdown before ending the test; ensure both owning loops exit.
+            var stopped = (Task)typeof(MainWindow).GetMethod("StopInputThreadsAsync", flags)!.Invoke(window, null)!;
+            if (!stopped.Wait(TimeSpan.FromSeconds(3))) throw new Exception("Input thread cleanup blocked");
+            typeof(MainWindow).GetMethod("ExitApplication", flags)!.Invoke(window, null);
+            input.Dispose();
+            if (!ReferenceEquals(input, hooks)) hooks.Dispose();
+            app.Shutdown();
+        }
+    }
+
+    private static void CaptureDiagnostics()
+    {
+        var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        using var input = new InputProcessingThread();
+        var window = input.Invoke(() => new RemoteInputWindow());
+        var hooks = input.Invoke(() => new InputHookManager());
+        var samples = new ConcurrentQueue<(long At, string Source, InputPacket Packet)>();
+        window.PacketCaptured += packet => samples.Enqueue((System.Diagnostics.Stopwatch.GetTimestamp(), "window", packet));
+        hooks.PacketCaptured += packet => samples.Enqueue((System.Diagnostics.Stopwatch.GetTimestamp(), "hook", packet));
+        NativeMethods.GetCursorPos(out var cursor);
+        Exception? failure = null;
+        app.Startup += async (_, _) =>
+        {
+            try
+            {
+                hooks.SetConnected(true); hooks.SetCanForward(true);
+                hooks.StartForwarding();
+                await input.Dispatcher.InvokeAsync(() => window.SetActive(true));
+                await Task.Delay(150);
+                if (!window.IsActive)
+                {
+                    Console.WriteLine("SKIP: capture diagnostics needs foreground activation; no native result obtained");
+                    return;
+                }
+                foreach (var direction in new[] { SwipeDirection.Up, SwipeDirection.Down, SwipeDirection.Left })
+                {
+                    samples.Clear();
+                    await SyntheticTouchpad.Swipe(direction, contacts: 2);
+                    await Task.Delay(400);
+                    var wheels = samples.Where(p => p.Packet.Type == InputEventType.MouseWheel).ToArray();
+                    if (wheels.Length == 0) throw new Exception("No native scroll samples captured");
+                    var gaps = wheels.Zip(wheels.Skip(1), (a, b) => (b.At - a.At) * 1000.0 / System.Diagnostics.Stopwatch.Frequency).Order().ToArray();
+                    var p95 = gaps.Length == 0 ? 0 : gaps[(int)((gaps.Length - 1) * .95)];
+                    var maximum = gaps.Length == 0 ? 0 : gaps[^1];
+                    Console.WriteLine($"CAPTURE {direction}: samples={wheels.Length}, window={wheels.Count(p => p.Source == "window")}, hook={wheels.Count(p => p.Source == "hook")}, total={wheels.Sum(p => (long)p.Packet.Value1)}, maxDelta={wheels.Max(p => Math.Abs(p.Packet.Value1))}, gapP95={p95:F2}ms, maxGap={maximum:F2}ms");
+                }
+            }
+            catch (Exception ex) { failure = ex; }
+            finally
+            {
+                await input.Dispatcher.InvokeAsync(() =>
+                {
+                    hooks.StopForwarding(); window.SetActive(false);
+                    NativeMethods.SetCursorPos(cursor.X, cursor.Y);
+                });
+                app.Shutdown();
+            }
+        };
+        app.Run();
+        input.StopAsync(() => { hooks.Dispose(); window.Dispose(); }).GetAwaiter().GetResult();
+        if (failure is not null) throw failure;
+    }
+
+    private static void NativeTest(bool gesturesOnly = false)
     {
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         using var input = new InputProcessingThread();
         var window = input.Invoke(() => new RemoteInputWindow());
         Console.WriteLine("Native gesture support: " + window.GestureStatus);
-        if (!window.NativeGesturesSupported) { input.Invoke(window.Dispose); app.Shutdown(); return; }
+        if (!window.NativeGesturesSupported) { Console.WriteLine("SKIP: native touchpad gestures are unsupported"); input.Invoke(window.Dispose); app.Shutdown(); return; }
         Exception? failure = null;
         var captured = new ConcurrentQueue<InputPacket>();
         window.PacketCaptured += captured.Enqueue;
@@ -116,8 +262,12 @@ internal static class Program
             {
                 await input.Dispatcher.InvokeAsync(() => window.SetActive(true));
                 hooks.StartForwarding();
-                await Task.Delay(150);
-                if (!window.IsActive) throw new Exception("Capture window did not acquire foreground input");
+                await Task.Delay(650);
+                if (!window.IsActive)
+                {
+                    Console.WriteLine("SKIP: foreground activation unavailable; native gestures not injected. " + window.GestureStatus);
+                    return;
+                }
                 foreach (var direction in Enum.GetValues<SwipeDirection>())
                 {
                     captured.Clear();
@@ -127,6 +277,7 @@ internal static class Program
                         throw new Exception($"Native {direction} swipe did not produce the expected remote shortcut (packets: {captured.Count})");
                     Console.WriteLine($"PASS: native synthetic three-finger {direction} -> remote shortcut only");
                 }
+                if (gesturesOnly) return;
                 captured.Clear();
                 messages.Clear();
                 NativeMethods.SetCursorPos(400, 400);

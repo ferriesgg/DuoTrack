@@ -4,8 +4,8 @@ namespace DuoTrack.Client;
 
 internal readonly record struct RoutedInput(Guid Peer, InputPacket Packet, long QueuedAt = 0);
 
-// Coalesce only adjacent scroll events. Button/key events, axis changes and
-// direction reversals are ordering barriers; no wheel distance is discarded.
+// Coalesce within ONE capture frame, up to ONE wheel notch. Never merge across
+// time merely because the network or input thread was temporarily busy.
 internal sealed class InputPacketQueue
 {
     private readonly LinkedList<RoutedInput> _items = new();
@@ -53,10 +53,11 @@ internal sealed class InputPacketQueue
         var a = first.Packet; var b = second.Packet;
         if (first.Peer != second.Peer || a.Type != InputEventType.MouseWheel || b.Type != a.Type
             || a.Value2 != b.Value2 || a.Flags != b.Flags || Math.Sign(a.Value1) != Math.Sign(b.Value1)) return false;
+        // Old peers provide no frame boundaries. Their remaining samples must
+        // stay separate instead of accumulating again at the receiving end.
+        if ((a.Flags & WheelCapture.FrameTag) == 0) return false;
         var sum = (long)a.Value1 + b.Value1;
-        // Windows wheel deltas are signed 16-bit values, including precision
-        // deltas smaller than WHEEL_DELTA (120). Preserve that representation.
-        if (sum is < short.MinValue or > short.MaxValue) return false;
+        if (sum is < -WheelCapture.MaximumMergedDelta or > WheelCapture.MaximumMergedDelta) return false;
         merged = first with { Packet = a with { Value1 = (int)sum } };
         return true;
     }

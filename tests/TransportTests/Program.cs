@@ -109,7 +109,8 @@ foreach (var key in shortcuts) bridgeA.Send(key);
 bridgeA.Send(new InputPacket(InputEventType.ReleaseAll));
 await WaitFor(() => bridgePackets.Any(p => p.Type == InputEventType.ReleaseAll), "Batched scrolling did not finish");
 var wheelPackets = bridgePackets.Where(p => p.Type == InputEventType.MouseWheel).ToArray();
-if (wheelPackets.Sum(p => (long)p.Value1) != 4000 || wheelPackets.Length >= 4000)
+if (wheelPackets.Sum(p => (long)p.Value1) != 4000 || wheelPackets.Length >= 4000
+    || wheelPackets.Any(p => p.Value1 > 120 || (p.Flags & WheelCapture.FrameTag) == 0))
     throw new Exception("LAN scroll coalescing lost precision or did not merge events");
 if (!bridgePackets.Where(p => p.Type == InputEventType.Key).SequenceEqual(shortcuts))
     throw new Exception("LAN gesture shortcut order changed");
@@ -208,4 +209,13 @@ if (args.Length > 0)
     await WaitFor(() => mixedPackets.Any(p => p.Type == InputEventType.MouseMove && p.Value1 == 9), "Relay fallback after direct connection loss failed");
     if (mixedA.GetDevices().Single().ConnectionMode != "公网中继") throw new Exception("Fallback route label failed");
     Console.WriteLine("PASS: actual relay routing, LAN preference, active direct disconnect and next-session relay fallback");
+    while (mixedPackets.TryDequeue(out _)) { }
+    mixedA.Send(enter);
+    var precise = Enumerable.Range(0, 20).Select(i => WheelCapture.Stamp(new InputPacket(InputEventType.MouseWheel, 6), 1000 + i * 8)).ToArray();
+    foreach (var packet in precise) mixedA.Send(packet);
+    mixedA.Send(new InputPacket(InputEventType.ReleaseAll));
+    await WaitFor(() => mixedPackets.Any(p => p.Type == InputEventType.ReleaseAll), "Timed wheel packets did not cross legacy relay");
+    if (!mixedPackets.Where(p => p.Type == InputEventType.MouseWheel).SequenceEqual(precise))
+        throw new Exception("Relay changed capture boundaries or wheel deltas");
+    Console.WriteLine("PASS: unchanged relay forwards 20 separate capture frames and exact deltas");
 }
