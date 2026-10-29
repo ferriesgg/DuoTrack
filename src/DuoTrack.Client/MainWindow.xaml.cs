@@ -20,12 +20,15 @@ public partial class MainWindow : Window
     private InputDispatchQueue? _inputDispatch;
     private readonly ObservableCollection<DeviceInfo> _devices = [];
     private readonly DispatcherTimer _refreshTimer;
+    private readonly DispatcherTimer _clipboardTimer;
     private readonly Forms.NotifyIcon _trayIcon;
     private BridgeConnection? _connection;
     private volatile bool _isExiting;
     private bool _initializing = true;
     private bool _refreshing;
     private bool _updatingDevices;
+    private bool _clipboardSending;
+    private string? _lastClipboardText;
     private Guid? _incomingDeviceId;
     private ScreenSide _incomingReturnSide;
     private ScreenGeometry _incomingScreen;
@@ -73,6 +76,9 @@ public partial class MainWindow : Window
         ServerUrlBox.Text = _settings.ServerUrl;
         DeviceNameBox.Text = _settings.DeviceName;
         StartWithWindowsCheck.IsChecked = _settings.StartWithWindows;
+        ClipboardSyncCheck.IsChecked = _settings.ClipboardSyncEnabled;
+        ClipboardStatusText.Text = _settings.ClipboardSyncEnabled
+            ? "已启用；最多同步 256 KB 的 Unicode 文本。" : "关闭时不会读取或发送剪贴板。";
         IsolateInjectionCheck.IsChecked = _settings.IsolateInputInjection;
         InjectionModeText.Text = _settings.IsolateInputInjection ? "当前模式：独立线程注入" : "当前模式：共用输入线程";
         EdgeSwitchCheck.IsChecked = _settings.EdgeSwitchEnabled;
@@ -83,9 +89,12 @@ public partial class MainWindow : Window
         _trayIcon = CreateTrayIcon();
         _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _refreshTimer.Tick += async (_, _) => await RefreshDevicesAsync();
+        _clipboardTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _clipboardTimer.Tick += ClipboardTimer_Tick;
         Loaded += async (_, _) =>
         {
             _initializing = false;
+            UpdateClipboardMonitor();
             if (!string.IsNullOrWhiteSpace(_settings.ServerUrl))
             {
                 await ConnectAsync();
@@ -146,6 +155,7 @@ public partial class MainWindow : Window
                     ReceiveInput(source, packet);
             });
             connection.PacketReceived += _inputDispatch.Enqueue;
+            connection.ClipboardReceived += (source, text) => Dispatcher.BeginInvoke(() => ApplyRemoteClipboard(source, text));
             _connection.ConnectionChanged += connected => Dispatcher.BeginInvoke(async () =>
             {
                 if (!ReferenceEquals(connection, _connection)) return;
@@ -482,6 +492,79 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ClipboardSync_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initializing) return;
+        try
+        {
+            _settings.ClipboardSyncEnabled = ClipboardSyncCheck.IsChecked == true;
+            _settings.Save();
+            UpdateClipboardMonitor();
+        }
+        catch (Exception ex) { ShowError(ex.Message); }
+    }
+
+    private void UpdateClipboardMonitor()
+    {
+        _lastClipboardText = TryReadClipboardText();
+        if (_settings.ClipboardSyncEnabled)
+        {
+            _clipboardTimer.Start();
+            ClipboardStatusText.Text = "已启用；最多同步 256 KB 的 Unicode 文本。";
+        }
+        else
+        {
+            _clipboardTimer.Stop();
+            ClipboardStatusText.Text = "关闭时不会读取或发送剪贴板。";
+        }
+    }
+
+    private async void ClipboardTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_clipboardSending || !_settings.ClipboardSyncEnabled || _connection is not { IsConnected: true } connection) return;
+        var text = TryReadClipboardText();
+        if (text is null || text == _lastClipboardText) return;
+        _lastClipboardText = text;
+        _clipboardSending = true;
+        try
+        {
+            await connection.SendClipboardAsync(text);
+            ClipboardStatusText.Text = "已同步本机文本剪贴板。";
+        }
+        catch (ArgumentException ex)
+        {
+            ClipboardStatusText.Text = ex.Message;
+        }
+        catch (Exception ex) when (ex is IOException or System.Net.WebSockets.WebSocketException or OperationCanceledException or ObjectDisposedException)
+        {
+            ClipboardStatusText.Text = "剪贴板同步暂时失败，将在下次复制时重试。";
+        }
+        finally { _clipboardSending = false; }
+    }
+
+    private void ApplyRemoteClipboard(Guid source, string text)
+    {
+        if (!_settings.ClipboardSyncEnabled || text == _lastClipboardText) return;
+        try
+        {
+            System.Windows.Clipboard.SetText(text, System.Windows.TextDataFormat.UnicodeText);
+            _lastClipboardText = text;
+            var name = _connection?.GetDevices().FirstOrDefault(device => device.Id == source)?.Name ?? "已配对设备";
+            ClipboardStatusText.Text = $"已接收来自 {name} 的文本剪贴板。";
+        }
+        catch (System.Runtime.InteropServices.ExternalException)
+        {
+            ClipboardStatusText.Text = "剪贴板正被其他程序占用，未能写入收到的文本。";
+        }
+    }
+
+    private static string? TryReadClipboardText()
+    {
+        try { return System.Windows.Clipboard.ContainsText(System.Windows.TextDataFormat.UnicodeText)
+                ? System.Windows.Clipboard.GetText(System.Windows.TextDataFormat.UnicodeText) : null; }
+        catch (System.Runtime.InteropServices.ExternalException) { return null; }
+    }
+
     private Forms.NotifyIcon CreateTrayIcon()
     {
         var menu = new Forms.ContextMenuStrip();
@@ -523,6 +606,7 @@ public partial class MainWindow : Window
         }
 
         _refreshTimer.Stop();
+        _clipboardTimer.Stop();
         _inputDispatch?.Dispose();
         _connection?.Dispose();
         _ = StopInputThreadsAsync();

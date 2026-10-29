@@ -34,8 +34,10 @@ lanB.Diagnostic += Console.WriteLine;
 lanA.Start(); lanB.Start();
 var receivedA = new ConcurrentQueue<InputPacket>();
 var receivedB = new ConcurrentQueue<InputPacket>();
+var clipboardB = new ConcurrentQueue<string>();
 lanA.PacketReceived += (id, packet) => { if (id != second.DeviceId) throw new Exception("Wrong peer A"); receivedA.Enqueue(packet); };
 lanB.PacketReceived += (id, packet) => { if (id != first.DeviceId) throw new Exception("Wrong peer B"); receivedB.Enqueue(packet); };
+lanB.ClipboardReceived += (id, text) => { if (id != first.DeviceId) throw new Exception("Wrong clipboard peer B"); clipboardB.Enqueue(text); };
 await lanA.ConnectPeerAsync(second.DeviceId, new IPEndPoint(IPAddress.Loopback, lanB.ListenPort));
 await WaitFor(() => lanA.IsConnected(second.DeviceId) && lanB.IsConnected(first.DeviceId), "Mutual TLS LAN connection failed");
 var enter = new InputPacket(InputEventType.EnterScreen, 1, 7500, 1);
@@ -50,7 +52,14 @@ if (!receivedB.TryDequeue(out var actualEnter) || actualEnter != enter) throw ne
 for (var i = 0; i < 500; i++)
     if (!receivedB.TryDequeue(out var move) || move.Value1 != i || move.Value2 != -i) throw new Exception("Input ordering failed");
 if (!receivedA.TryDequeue(out var actualReturn) || actualReturn != returnControl) throw new Exception("ReturnControl was changed");
-Console.WriteLine("PASS: persisted peer trust, mutual TLS, 500 ordered movements, bidirectional screen transitions without relay");
+var clipboardText = "DuoTrack 剪贴板 ✅\r\n第二行";
+if (!await lanA.SendClipboardAsync(second.DeviceId, clipboardText, CancellationToken.None)) throw new Exception("LAN clipboard send failed");
+await WaitFor(() => clipboardB.TryPeek(out _), "LAN clipboard delivery failed");
+if (!clipboardB.TryDequeue(out var actualClipboard) || actualClipboard != clipboardText) throw new Exception("LAN clipboard text changed");
+var clipboardWire = RelayWire.EncodeClipboard(second.DeviceId, clipboardText);
+if (!RelayWire.TryDecodeClipboard(clipboardWire, out var clipboardTarget, out var decodedClipboard)
+    || clipboardTarget != second.DeviceId || decodedClipboard != clipboardText) throw new Exception("Clipboard wire roundtrip failed");
+Console.WriteLine("PASS: persisted peer trust, mutual TLS, input and Unicode clipboard delivery without relay");
 
 var strangerStore = new TrustedPeerStore("test", Path.Combine(directory, "stranger.json"));
 strangerStore.Update([new DeviceInfo(second.DeviceId, "B", true, second.PublicKey)], true);
@@ -181,8 +190,10 @@ if (args.Length > 0)
     using var mixedA = new BridgeConnection(relayApiA, "LAN fallback A", first, relayLanA);
     using var mixedB = new BridgeConnection(relayApiB, "LAN fallback B", second, relayLanB);
     var mixedPackets = new ConcurrentQueue<InputPacket>();
+    var mixedClipboard = new ConcurrentQueue<string>();
     var lost = false;
     mixedB.PacketReceived += (_, packet) => mixedPackets.Enqueue(packet);
+    mixedB.ClipboardReceived += (_, text) => mixedClipboard.Enqueue(text);
     mixedA.PeerConnectionLost += _ => { lost = true; mixedA.Send(new InputPacket(InputEventType.ReleaseAll)); };
     mixedA.Start(); mixedB.Start();
     await WaitFor(() => mixedA.IsRelayConnected && mixedB.IsRelayConnected, "Relay authentication failed", 12);
@@ -195,6 +206,8 @@ if (args.Length > 0)
     mixedA.Send(new InputPacket(InputEventType.ReleaseAll));
     await WaitFor(() => mixedPackets.Count == 3, "Relay-only bridge routing failed");
     if (mixedA.GetDevices().Single().ConnectionMode != "公网中继") throw new Exception("Relay route label failed");
+    await mixedA.SendClipboardAsync("relay clipboard 文本");
+    await WaitFor(() => mixedClipboard.Contains("relay clipboard 文本"), "Relay clipboard routing failed");
     await relayLanA.ConnectPeerAsync(second.DeviceId, new IPEndPoint(IPAddress.Loopback, relayLanB.ListenPort));
     await WaitFor(() => relayLanA.HasPeers && relayLanB.HasPeers, "LAN upgrade failed");
     mixedA.Send(enter);

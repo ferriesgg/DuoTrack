@@ -18,6 +18,7 @@ internal sealed class BridgeConnection : IDisposable
     private readonly ConcurrentDictionary<Guid, bool> _sessionRoutes = new(); // true = LAN
     private readonly ConcurrentDictionary<Guid, byte> _interrupted = new();
     private readonly object _stateLock = new();
+    private readonly SemaphoreSlim _relaySendLock = new(1, 1);
     private DeviceInfo[] _serverDevices = [];
     private ClientWebSocket? _relaySocket;
     private Task? _runTask;
@@ -36,6 +37,7 @@ internal sealed class BridgeConnection : IDisposable
     public event Action? DevicesChanged;
     public event Action<Guid>? PeerConnectionLost;
     public event Action<Guid, InputPacket>? PacketReceived;
+    public event Action<Guid, string>? ClipboardReceived;
 
     public BridgeConnection(BridgeApiClient api, string deviceName, DeviceIdentity identity, LanPeerTransport? lan = null)
     {
@@ -43,6 +45,7 @@ internal sealed class BridgeConnection : IDisposable
         _deviceName = deviceName;
         _lan = lan ?? new LanPeerTransport(identity, api.TrustedPeers);
         _lan.PacketReceived += (id, packet) => OnPacket(id, packet, direct: true);
+        _lan.ClipboardReceived += (id, text) => ClipboardReceived?.Invoke(id, text);
         _lan.Diagnostic += message => StatusChanged?.Invoke(message);
         _lan.PeerChanged += (id, connected) =>
         {
@@ -98,6 +101,19 @@ internal sealed class BridgeConnection : IDisposable
         _outgoingWake.Writer.TryWrite(0);
     }
 
+    public async Task SendClipboardAsync(string text, CancellationToken token = default)
+    {
+        if (System.Text.Encoding.UTF8.GetByteCount(text) > RelayWire.MaxClipboardBytes)
+            throw new ArgumentException("剪贴板文本超过 256 KB，未同步。", nameof(text));
+        foreach (var device in GetDevices().Where(device => device.Online))
+        {
+            if (_lan.IsConnected(device.Id))
+                await _lan.SendClipboardAsync(device.Id, text, token);
+            else if (_relaySocket is { State: WebSocketState.Open })
+                await SendRelayAsync(RelayWire.EncodeClipboard(device.Id, text), token);
+        }
+    }
+
     private void OnPacket(Guid source, InputPacket packet, bool direct)
     {
         ScrollDiagnostics.Observe(direct ? ScrollStage.ReceiveLan : ScrollStage.ReceiveRelay, packet);
@@ -151,7 +167,7 @@ internal sealed class BridgeConnection : IDisposable
                         {
                             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                             timeout.CancelAfter(TimeSpan.FromSeconds(3));
-                            await socket.SendAsync(RelayWire.EncodeInput(target, packet), WebSocketMessageType.Binary, true, timeout.Token);
+                            await SendRelayAsync(RelayWire.EncodeInput(target, packet), timeout.Token);
                             sent = true;
                         }
                         catch (Exception ex) when (ex is WebSocketException or OperationCanceledException or ObjectDisposedException) { }
@@ -235,14 +251,40 @@ internal sealed class BridgeConnection : IDisposable
 
     private async Task ReceiveRelayAsync(ClientWebSocket socket, CancellationToken token)
     {
-        var buffer = new byte[4096];
+        var buffer = new byte[17 + RelayWire.MaxClipboardBytes];
         while (socket.State == WebSocketState.Open && !token.IsCancellationRequested)
         {
-            var result = await socket.ReceiveAsync(buffer, token);
-            if (result.MessageType == WebSocketMessageType.Close) return;
-            if (result.MessageType == WebSocketMessageType.Binary && result.EndOfMessage &&
-                RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var source, out var packet))
+            var count = await ReceiveMessageAsync(socket, buffer, token);
+            if (count is null) return;
+            if (RelayWire.TryDecodeInput(buffer.AsSpan(0, count.Value), out var source, out var packet))
                 OnPacket(source, packet, direct: false);
+            else if (RelayWire.TryDecodeClipboard(buffer.AsSpan(0, count.Value), out source, out var text))
+                ClipboardReceived?.Invoke(source, text);
+        }
+    }
+
+    private async Task SendRelayAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    {
+        await _relaySendLock.WaitAsync(token);
+        try
+        {
+            if (_relaySocket is not { State: WebSocketState.Open } socket) throw new WebSocketException("中继未连接。");
+            await socket.SendAsync(payload, WebSocketMessageType.Binary, true, token);
+        }
+        finally { _relaySendLock.Release(); }
+    }
+
+    private static async Task<int?> ReceiveMessageAsync(ClientWebSocket socket, byte[] buffer, CancellationToken token)
+    {
+        var count = 0;
+        while (true)
+        {
+            var result = await socket.ReceiveAsync(buffer.AsMemory(count), token);
+            if (result.MessageType == WebSocketMessageType.Close) return null;
+            count += result.Count;
+            if (result.MessageType != WebSocketMessageType.Binary || (!result.EndOfMessage && count == buffer.Length))
+                throw new WebSocketException("收到无效消息。");
+            if (result.EndOfMessage) return count;
         }
     }
 

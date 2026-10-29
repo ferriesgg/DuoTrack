@@ -8,6 +8,7 @@ internal sealed class ClientSettings
     public string DeviceName { get; set; } = Environment.MachineName;
     public bool StartWithWindows { get; set; }
     public bool EdgeSwitchEnabled { get; set; }
+    public bool ClipboardSyncEnabled { get; set; }
     public bool IsolateInputInjection { get; set; }
     public DuoTrack.Protocol.ScreenSide RemoteScreenSide { get; set; } = DuoTrack.Protocol.ScreenSide.Right;
     public Guid? LayoutDeviceId { get; set; }

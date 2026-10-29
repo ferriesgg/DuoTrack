@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Text;
 
 namespace DuoTrack.Protocol;
 
@@ -68,7 +69,9 @@ public readonly record struct InputPacket(
 public static class RelayWire
 {
     public const byte InputMessage = 1;
+    public const byte ClipboardMessage = 2;
     public const int InputWireSize = 1 + 16 + InputPacket.WireSize;
+    public const int MaxClipboardBytes = 256 * 1024;
 
     public static byte[] EncodeInput(Guid targetDeviceId, InputPacket packet)
     {
@@ -90,5 +93,37 @@ public static class RelayWire
 
         targetDeviceId = new Guid(data.Slice(1, 16));
         return InputPacket.TryDecode(data.Slice(17), out packet);
+    }
+
+    public static byte[] EncodeClipboard(Guid targetDeviceId, string text)
+    {
+        var payload = Encoding.UTF8.GetBytes(text);
+        if (payload.Length > MaxClipboardBytes)
+            throw new ArgumentException($"Clipboard text exceeds {MaxClipboardBytes} UTF-8 bytes", nameof(text));
+        var buffer = new byte[1 + 16 + payload.Length];
+        buffer[0] = ClipboardMessage;
+        targetDeviceId.TryWriteBytes(buffer.AsSpan(1, 16));
+        payload.CopyTo(buffer.AsSpan(17));
+        return buffer;
+    }
+
+    public static bool TryDecodeClipboard(ReadOnlySpan<byte> data, out Guid targetDeviceId, out string text)
+    {
+        targetDeviceId = default;
+        text = string.Empty;
+        if (data.Length < 17 || data.Length > 17 + MaxClipboardBytes || data[0] != ClipboardMessage)
+            return false;
+        try
+        {
+            targetDeviceId = new Guid(data.Slice(1, 16));
+            text = new UTF8Encoding(false, true).GetString(data.Slice(17));
+            return true;
+        }
+        catch (DecoderFallbackException)
+        {
+            targetDeviceId = default;
+            text = string.Empty;
+            return false;
+        }
     }
 }

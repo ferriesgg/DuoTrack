@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Security;
@@ -29,6 +30,7 @@ internal sealed class LanPeerTransport : IDisposable
     private int _disposed;
 
     public event Action<Guid, InputPacket>? PacketReceived;
+    public event Action<Guid, string>? ClipboardReceived;
     public event Action<Guid, bool>? PeerChanged;
     public event Action<string>? Diagnostic;
     public int ListenPort => ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -202,24 +204,67 @@ internal sealed class LanPeerTransport : IDisposable
         finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
     }
 
+    public async Task<bool> SendClipboardAsync(Guid id, string text, CancellationToken token)
+    {
+        if (!_links.TryGetValue(id, out var link)) return false;
+        var payload = System.Text.Encoding.UTF8.GetBytes(text);
+        if (payload.Length > RelayWire.MaxClipboardBytes) throw new ArgumentException("剪贴板文本过大。", nameof(text));
+        var buffer = ArrayPool<byte>.Shared.Rent(5 + payload.Length);
+        try
+        {
+            buffer[0] = 3;
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(1, 4), payload.Length);
+            payload.CopyTo(buffer.AsSpan(5));
+            await link.WriteAsync(buffer.AsMemory(0, 5 + payload.Length), token);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            Detach(id, link);
+            return false;
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+    }
+
     private async Task ReadPeerAsync(Guid id, PeerLink link)
     {
         try
         {
-            var frame = new byte[1 + InputPacket.WireSize];
+            var type = new byte[1];
+            var fixedPayload = new byte[InputPacket.WireSize];
             while (!_stop.IsCancellationRequested)
             {
-                await link.Stream.ReadExactlyAsync(frame, _stop.Token);
+                await link.Stream.ReadExactlyAsync(type, _stop.Token);
                 link.LastReceived = Environment.TickCount64;
                 if (_trust.Find(id)?.PublicKey != link.PublicKey) break;
-                if (frame[0] == 0 && InputPacket.TryDecode(frame.AsSpan(1), out var packet))
-                    PacketReceived?.Invoke(id, packet);
-                else if (frame[0] == 1)
+                if (type[0] == 0)
                 {
-                    var pong = new byte[frame.Length]; pong[0] = 2;
+                    await link.Stream.ReadExactlyAsync(fixedPayload, _stop.Token);
+                    if (!InputPacket.TryDecode(fixedPayload, out var packet)) break;
+                    PacketReceived?.Invoke(id, packet);
+                }
+                else if (type[0] == 1)
+                {
+                    await link.Stream.ReadExactlyAsync(fixedPayload, _stop.Token);
+                    var pong = new byte[1 + InputPacket.WireSize]; pong[0] = 2;
                     await link.WriteAsync(pong, _stop.Token);
                 }
-                else if (frame[0] != 2) break;
+                else if (type[0] == 2)
+                {
+                    await link.Stream.ReadExactlyAsync(fixedPayload, _stop.Token);
+                }
+                else if (type[0] == 3)
+                {
+                    var sizeBytes = new byte[4];
+                    await link.Stream.ReadExactlyAsync(sizeBytes, _stop.Token);
+                    var size = BinaryPrimitives.ReadInt32LittleEndian(sizeBytes);
+                    if (size is < 0 or > RelayWire.MaxClipboardBytes) break;
+                    var payload = new byte[size];
+                    await link.Stream.ReadExactlyAsync(payload, _stop.Token);
+                    try { ClipboardReceived?.Invoke(id, new System.Text.UTF8Encoding(false, true).GetString(payload)); }
+                    catch (System.Text.DecoderFallbackException) { break; }
+                }
+                else break;
             }
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException) { }

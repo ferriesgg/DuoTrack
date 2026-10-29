@@ -21,7 +21,8 @@ internal static class Program
             view.Measure(new Size(864, 791));
             view.Arrange(new Rect(0, 0, 864, 791));
             view.UpdateLayout();
-            foreach (var name in new[] { "LayoutLeft", "LayoutRight", "LayoutTop", "LayoutBottom", "EdgeSwitchCheck", "IsolateInjectionCheck", "InjectionModeText" })
+            foreach (var name in new[] { "LayoutLeft", "LayoutRight", "LayoutTop", "LayoutBottom", "EdgeSwitchCheck",
+                         "ClipboardSyncCheck", "ClipboardStatusText", "IsolateInjectionCheck", "InjectionModeText" })
             {
                 if (window.FindName(name) is not FrameworkElement control || control.ActualHeight < 12)
                     throw new Exception($"Missing or collapsed layout control: {name}");

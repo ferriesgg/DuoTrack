@@ -165,32 +165,27 @@ app.Map("/connect", async context =>
     app.Logger.LogInformation("Device {DeviceId} connected", deviceId);
     try
     {
-        var buffer = new byte[4096];
+        var buffer = new byte[17 + RelayWire.MaxClipboardBytes];
         while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
         {
-            var result = await socket.ReceiveAsync(buffer, context.RequestAborted);
-            if (result.MessageType == WebSocketMessageType.Close)
+            var count = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
+            if (count is null) break;
+            if (RelayWire.TryDecodeInput(buffer.AsSpan(0, count.Value), out var targetId, out var packet))
             {
+                if (!await repository.ArePairedAsync(deviceId, targetId)) continue;
+                if (connections.TryGet(targetId, out var target))
+                    await target.SendAsync(RelayWire.EncodeInput(deviceId, packet), context.RequestAborted);
+            }
+            else if (RelayWire.TryDecodeClipboard(buffer.AsSpan(0, count.Value), out targetId, out var text))
+            {
+                if (!await repository.ArePairedAsync(deviceId, targetId)) continue;
+                if (connections.TryGet(targetId, out var target))
+                    await target.SendAsync(RelayWire.EncodeClipboard(deviceId, text), context.RequestAborted);
+            }
+            else
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "Invalid message", context.RequestAborted);
                 break;
-            }
-
-            if (result.MessageType != WebSocketMessageType.Binary || !result.EndOfMessage ||
-                !RelayWire.TryDecodeInput(buffer.AsSpan(0, result.Count), out var targetId, out var packet))
-            {
-                await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "Invalid input message", context.RequestAborted);
-                break;
-            }
-
-            if (!await repository.ArePairedAsync(deviceId, targetId))
-            {
-                continue;
-            }
-
-            if (connections.TryGet(targetId, out var target))
-            {
-                // Client -> relay carries the destination; relay -> client carries
-                // the authenticated source so a screen can return control to it.
-                await target.SendAsync(RelayWire.EncodeInput(deviceId, packet), context.RequestAborted);
             }
         }
     }
@@ -224,6 +219,20 @@ app.Map("/connect", async context =>
 });
 
 app.Run();
+
+static async Task<int?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken token)
+{
+    var count = 0;
+    while (true)
+    {
+        var result = await socket.ReceiveAsync(buffer.AsMemory(count), token);
+        if (result.MessageType == WebSocketMessageType.Close) return null;
+        count += result.Count;
+        if (result.MessageType != WebSocketMessageType.Binary || (!result.EndOfMessage && count == buffer.Length))
+            throw new WebSocketException(WebSocketError.InvalidMessageType);
+        if (result.EndOfMessage) return count;
+    }
+}
 
 record RegisterDeviceRequest(string DeviceId, string Name, string PublicKey, string Signature);
 record ChallengeResponse(string Challenge);
